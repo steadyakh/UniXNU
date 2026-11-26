@@ -1,0 +1,73 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 9748fcc..c155a6f 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -351,6 +351,20 @@ static uintptr_t x1s_fb = 0xF1000000ULL;     /* V=P until arm_vm_init(), then an
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ void x1s_bar(unsigned idx, uint32_t color);
++void x1s_thin_bar(unsigned row, uint32_t color);
++void
++x1s_thin_bar(unsigned row, uint32_t color)
++{
++	extern uintptr_t x1s_fb_addr(void);
++	if (row + 16 > 3200) {
++		return;
++	}
++	volatile uint32_t *p = (volatile uint32_t *)(x1s_fb_addr() + (uint64_t)row * 1440 * 4);
++	for (unsigned i = 0; i < 16 * 1440; i++) {
++		p[i] = color;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
+ void
+ x1s_bar(unsigned idx, uint32_t color)
+ {
+@@ -360,6 +374,12 @@ x1s_bar(unsigned idx, uint32_t color)
+ 
+ void x1s_mark_impl(unsigned idx, uint32_t color);
+ #define x1s_mark x1s_mark_impl
++uintptr_t x1s_fb_addr(void);
++uintptr_t
++x1s_fb_addr(void)
++{
++	return x1s_fb;
++}
+ void
+ x1s_mark(unsigned idx, uint32_t color)
+ {
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+index 8d32f01..c42c83d 100644
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -219,9 +219,22 @@ TUNABLE(startup_debug_t, startup_debug, "startup_debug", 0);
+ /* Indicates a server boot when set */
+ TUNABLE(int, serverperfmode, "serverperfmode", 0);
+ 
++
++/* x1s bring-up: one thin bar per bootstrap stage on the S20's panel (x1s_fb from arm_init.c) */
++static unsigned x1s_stage;
++static void
++x1s_stage_bar(void)
++{
++	extern void x1s_thin_bar(unsigned row, uint32_t color);
++	static const uint32_t colors[6] = { 0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFF00, 0xFF00FFFF, 0xFFFF00FF };
++	x1s_thin_bar(2240 + x1s_stage * 20, colors[x1s_stage % 6]);
++	x1s_stage++;
++}
++
+ static inline void
+ kernel_bootstrap_log(const char *message)
+ {
++	x1s_stage_bar();
+ 	if ((startup_debug & STARTUP_DEBUG_VERBOSE) &&
+ 	    startup_phase >= STARTUP_SUB_KPRINTF) {
+ 		kprintf("kernel_bootstrap: %s\n", message);
+@@ -232,6 +245,7 @@ kernel_bootstrap_log(const char *message)
+ static inline void
+ kernel_bootstrap_thread_log(const char *message)
+ {
++	x1s_stage_bar();
+ 	if ((startup_debug & STARTUP_DEBUG_VERBOSE) &&
+ 	    startup_phase >= STARTUP_SUB_KPRINTF) {
+ 		kprintf("kernel_bootstrap_thread: %s\n", message);
