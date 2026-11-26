@@ -1,0 +1,57 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 5483077..9748fcc 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -350,7 +350,17 @@ arm_auxkc_init(void *mh, void *base)
+ static uintptr_t x1s_fb = 0xF1000000ULL;     /* V=P until arm_vm_init(), then an ml_io_map() */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+-static void
++void x1s_bar(unsigned idx, uint32_t color);
++void
++x1s_bar(unsigned idx, uint32_t color)
++{
++	extern void x1s_mark_impl(unsigned, uint32_t);
++	x1s_mark_impl(idx, color);
++}
++
++void x1s_mark_impl(unsigned idx, uint32_t color);
++#define x1s_mark x1s_mark_impl
++void
+ x1s_mark(unsigned idx, uint32_t color)
+ {
+ 	volatile uint32_t *p = (volatile uint32_t *)(x1s_fb + (uint64_t)idx * 80 * 1440 * 4);
+@@ -719,6 +729,7 @@ arm_init(
+ 	 * against string vulnerabilities
+ 	 */
+ 	__stack_chk_guard &= ~(0xFFULL << 8);
++	x1s_mark(23, 0xFF00FFFF);   /* cyan: machine_startup() next */
+ 	machine_startup(args);
+ }
+ 
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index afdd623..a8aa65a 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -534,6 +534,7 @@ user_timebase_type(void)
+ void
+ machine_startup(__unused boot_args * args)
+ {
++	{ extern void x1s_bar(unsigned, uint32_t); x1s_bar(26, 0xFF80FF00); }   /* chartreuse: machine_startup entered */
+ #if defined(HAS_IPI) && (DEVELOPMENT || DEBUG)
+ 	if (!PE_parse_boot_argn("fastipi", &gFastIPI, sizeof(gFastIPI))) {
+ 		gFastIPI = 1;
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+index dccdff8..8d32f01 100644
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -526,7 +526,9 @@ kernel_bootstrap(void)
+ 
+ 	code_signing_config_t cs_config;
+ 
++	{ extern void x1s_bar(unsigned, uint32_t); x1s_bar(24, 0xFFFF00FF); }   /* magenta: kernel_bootstrap */
+ 	printf("%s\n", version); /* log kernel version */
++	{ extern void x1s_bar(unsigned, uint32_t); x1s_bar(25, 0xFFFFFF00); }   /* yellow: first printf done */
+ 	printf("Kernel boot args: %s\n", PE_boot_args());
+ 
+ #if HAS_UPSI_FAILURE_INJECTION
