@@ -1,0 +1,24 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index dafb6d3..5483077 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -611,6 +611,7 @@ arm_init(
+ 	const unsigned int serial_exists = serial_init();
+ 	x1s_mark(9, 0xFF808080);    /* grey: serial_init() done */
+ 	kernel_startup_initialize_upto(STARTUP_SUB_KPRINTF);
++	x1s_mark(16, 0xFF00FF80);   /* mint: startup up to KPRINTF done */
+ 	kprintf("kprintf initialized\n");
+ 
+ 	serialmode = 0;
+@@ -651,9 +652,11 @@ arm_init(
+ 		(void)switch_to_serial_console(); /* Switch into serial mode from video console */
+ 		disableConsoleOutput = FALSE;     /* Allow printfs to happen */
+ 	}
++	x1s_mark(17, 0xFF8000FF);   /* violet: PE_create_console() next */
+ 	PE_create_console();
+ 
+ 	/* setup console output */
++	x1s_mark(18, 0xFFFFFF00);   /* yellow: PE_create_console() done */
+ 	PE_init_printf(FALSE);
+ 	x1s_mark(10, 0xFF804000);   /* brown: PE_init_printf() done */
+ 
