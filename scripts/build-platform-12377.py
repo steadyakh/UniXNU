@@ -23,6 +23,10 @@ if args.component == 'ArmCpu':
     for patch_name in ('ArmCpu-arm64-assembly.patch', 'ArmCpu-12377-boot-interrupt.patch'):
         driver_patch = ROOT / 'patches/drivers' / patch_name
         subprocess.run(['git', 'apply', '--directory', str(out.relative_to(ROOT)), driver_patch], cwd=ROOT, check=True)
+    # A device module may carry its own edits for the patched driver (x1s: GICv2), run after the series above.
+    hook = ROOT / 'drivers' / args.component / 'post-patch.py'
+    if hook.exists():
+        subprocess.run(['python3', str(hook), str(patched)], cwd=ROOT, check=True)
     source = patched
 # Darwin's ARM64 assembler treats ';' as a comment: use explicit newlines.
 for assembly in re.findall(r'__asm__\s+volatile\s*\(\s*"((?:\\.|[^"\\])*)"', source.read_text()):
