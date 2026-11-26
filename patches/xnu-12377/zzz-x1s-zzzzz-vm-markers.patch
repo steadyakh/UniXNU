@@ -1,0 +1,58 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 0ac4b57..31a3120 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1807,6 +1807,21 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+ #define ARM64_PHYSMAP_SLIDE_RANGE (1ULL << 30) // 1 GB
+ #define ARM64_PHYSMAP_SLIDE_MASK  (ARM64_PHYSMAP_SLIDE_RANGE - 1)
+ 
++/* x1s bring-up: a progress bar through the bootstrap V=P framebuffer mapping (start.s), rows idx*80.. */
++static void
++x1s_vm_mark(unsigned idx, uint32_t color)
++{
++	volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)(0xF1000000ULL + (uint64_t)idx * 80 * 1440 * 4);
++	for (unsigned i = 0; i < 80 * 1440; i++) {
++		p[i] = color;
++	}
++	for (uintptr_t a = (uintptr_t)p; a < (uintptr_t)(p + 80 * 1440); a += 64) {
++		__asm__ volatile ("dc civac, %0" :: "r"(a) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++
+ void
+ arm_vm_init(uint64_t memory_size, boot_args * args)
+ {
+@@ -1824,6 +1839,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	 * Get the virtual and physical kernel-managed memory base from boot_args.
+ 	 */
+ 	gVirtBase = args->virtBase;
++	x1s_vm_mark(12, 0xFF00C000);   /* dark green: arm_vm_init entered */
+ 	gPhysBase = args->physBase;
+ #if KASAN
+ 	real_phys_size = args->memSize + (shadow_ptop - shadow_pbase);
+@@ -1849,6 +1865,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 		max_mem_actual = mem_actual;
+ 	}
+ #if !defined(ARM_LARGE_MEMORY)
++	x1s_vm_mark(13, 0xFF0080FF);   /* sky blue: memory size computed */
+ 	if (mem_size >= ((VM_MAX_KERNEL_ADDRESS - VM_MIN_KERNEL_ADDRESS) / 2)) {
+ 		panic("Unsupported memory configuration %lx", mem_size);
+ 	}
+@@ -1922,6 +1939,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	size_t l1_entries = 1 + ((bytes_mapped + ARM_TT_L1_SIZE - 1) / ARM_TT_L1_SIZE);
+ 	/* 1 L1 each for V=P and KVA, plus 1 page for each L2 */
+ 	size_t pages_used = 2 * (l1_entries + 1);
++	x1s_vm_mark(14, 0xFFC000C0);   /* purple: bootstrap table check next */
+ 	if (pages_used > BOOTSTRAP_TABLE_SIZE) {
+ 		panic("BOOTSTRAP_TABLE_SIZE too small for memory config");
+ 	}
+@@ -1941,6 +1959,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	first_avail_phys = avail_start = args->topOfKernelData;
+ 
+ #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR) || defined(KERNEL_INTEGRITY_PV_CTRR)
++	x1s_vm_mark(15, 0xFFFFFF80);   /* light yellow: replacing the identity map next */
+ 	arm_replace_identity_map();
+ #endif
+ 
