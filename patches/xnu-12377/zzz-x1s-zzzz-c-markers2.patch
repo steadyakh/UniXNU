@@ -1,0 +1,52 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index d98041f..dafb6d3 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -347,10 +347,13 @@ arm_auxkc_init(void *mh, void *base)
+ 
+ /* x1s bring-up: a progress bar on the S20's panel (1440 wide, a8r8g8b8), through the bootstrap V=P mapping of the
+  * framebuffer (start.s); only valid until arm_vm_init() replaces the bootstrap tables. */
++static uintptr_t x1s_fb = 0xF1000000ULL;     /* V=P until arm_vm_init(), then an ml_io_map() */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
+ static void
+ x1s_mark(unsigned idx, uint32_t color)
+ {
+-	volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)(0xF1000000ULL + (uint64_t)idx * 80 * 1440 * 4);
++	volatile uint32_t *p = (volatile uint32_t *)(x1s_fb + (uint64_t)idx * 80 * 1440 * 4);
+ 	for (unsigned i = 0; i < 80 * 1440; i++) {
+ 		p[i] = color;
+ 	}
+@@ -591,6 +594,8 @@ arm_init(
+ 
+ 	x1s_mark(7, 0xFFFF8000);    /* orange: about to set up VM */
+ 	arm_vm_init(xmaxmem, args);
++	x1s_fb = (uintptr_t)ml_io_map(0xF1000000ULL, 1440 * 3200 * 4);
++	x1s_mark(8, 0xFF8080FF);    /* light blue: arm_vm_init() done, framebuffer mapped again */
+ 
+ 	if (debug_boot_arg) {
+ 		patch_low_glo();
+@@ -604,6 +609,7 @@ arm_init(
+ 
+ 	/* Setup debugging output. */
+ 	const unsigned int serial_exists = serial_init();
++	x1s_mark(9, 0xFF808080);    /* grey: serial_init() done */
+ 	kernel_startup_initialize_upto(STARTUP_SUB_KPRINTF);
+ 	kprintf("kprintf initialized\n");
+ 
+@@ -649,6 +655,7 @@ arm_init(
+ 
+ 	/* setup console output */
+ 	PE_init_printf(FALSE);
++	x1s_mark(10, 0xFF804000);   /* brown: PE_init_printf() done */
+ 
+ #if __arm64__
+ #if DEBUG
+@@ -659,6 +666,7 @@ arm_init(
+ 	cpu_machine_idle_init(TRUE);
+ 
+ 	PE_init_platform(TRUE, &BootCpuData);
++	x1s_mark(11, 0xFFFFC0C0);   /* pink: PE_init_platform(TRUE) done (console up) */
+ 
+ 	/* Initialize the debug infrastructure system-wide and on the local core. */
+ 	pe_arm_debug_init_early(&BootCpuData);
