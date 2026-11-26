@@ -1,0 +1,48 @@
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+index 9aa44e9..4e23680 100644
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -556,6 +556,22 @@ PE_init_platform(boolean_t vm_initialized, void *args)
+ 	}
+ }
+ 
++
++/* x1s bring-up: a progress bar on the S20's panel through a fresh mapping of the framebuffer */
++static void
++x1s_pe_mark(unsigned idx, uint32_t color)
++{
++	static uintptr_t fb;
++	if (fb == 0) {
++		fb = (uintptr_t)ml_io_map(0xF1000000ULL, 1440 * 3200 * 4);
++	}
++	volatile uint32_t *p = (volatile uint32_t *)(fb + (uint64_t)idx * 80 * 1440 * 4);
++	for (unsigned i = 0; i < 80 * 1440; i++) {
++		p[i] = color;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
+ void
+ PE_create_console(void)
+ {
+@@ -563,7 +579,9 @@ PE_create_console(void)
+ 	 * Check the head of VRAM for a panic log saved on last panic.
+ 	 * Do this before the VRAM is trashed.
+ 	 */
++	x1s_pe_mark(19, 0xFF40FF40);   /* lime: PE_create_console entered */
+ 	check_for_panic_log();
++	x1s_pe_mark(20, 0xFF4040FF);   /* blue: panic-log check done */
+ 
+ 	/* The ARM graphics path otherwise ignores -v and hides the kernel log. */
+ 	int verbose = 0;
+@@ -571,8 +589,10 @@ PE_create_console(void)
+ 	if (PE_state.video.v_display && !verbose) {
+ 		PE_initialize_console(&PE_state.video, kPEGraphicsMode);
+ 	} else {
++		x1s_pe_mark(21, 0xFFFF4040);   /* red: text console next */
+ 		PE_initialize_console(&PE_state.video, kPETextMode);
+ 	}
++	x1s_pe_mark(22, 0xFFFFFFFF);   /* white: console started */
+ }
+ 
+ int
