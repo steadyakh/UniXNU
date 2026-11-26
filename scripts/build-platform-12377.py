@@ -48,7 +48,7 @@ while index < len(arguments):
     index += 1
 command += ['-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', '-Wno-c99-designator',
             '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion',
-            '-Wno-unnecessary-virtual-specifier']
+            '-Wno-unknown-warning-option', '-Wno-unnecessary-virtual-specifier']
 (out / 'compile-command.json').write_text(json.dumps(command, indent=2) + '\n')
 result = subprocess.run(command, cwd=record['directory'], capture_output=True, text=True)
 (out / 'compile.log').write_text(result.stdout + result.stderr)
