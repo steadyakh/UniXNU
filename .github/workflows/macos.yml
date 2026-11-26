@@ -69,7 +69,7 @@ env:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-15-intel   # x1s: arm64 macOS runners were unavailable (stayed queued)
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
