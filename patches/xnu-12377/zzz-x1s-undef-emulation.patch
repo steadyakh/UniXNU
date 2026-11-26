@@ -1,6 +1,6 @@
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
-@@ -1178,6 +1178,215 @@
+@@ -1178,6 +1178,214 @@
  }
  
  /*
@@ -203,8 +203,7 @@
 +	}
 +	if (x1s_undef_logged < 64) {
 +		x1s_undef_logged++;
-+		printf("x1s: undefined instruction %08x at %llx
-+", instr, pc);
++		printf("x1s: undefined instruction %08x at %llx\n", instr, pc);
 +	}
 +	return false;
 +next:
@@ -216,7 +215,7 @@
   * Uncategorized exceptions are a catch-all for general execution errors.
   * ARM64_TODO: For now, we assume this is for undefined instruction exceptions.
   */
-@@ -1252,6 +1461,11 @@
+@@ -1252,6 +1460,11 @@
  		} else {
  			panic("Undefined kernel instruction: pc=%p instr=%x", (void*)get_saved_state_pc(state), instr);
  		}
