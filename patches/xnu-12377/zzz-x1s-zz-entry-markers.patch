@@ -1,0 +1,61 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 3ed10c7..e9b1621 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -475,6 +475,18 @@ LEXT(start_first_cpu)
+ 
+ 	mov		x20, x0
+ 	mov		x21, #0
++	// x1s bring-up: progress bar 0 (0xffff0000) at rows 0..79
++	movz	x1, #0x0
++	movk	x1, #0xf100, lsl #16
++	movz	w2, #0x0
++	movk	w2, #0xffff, lsl #16
++	movz	x3, #0xc200
++	movk	x3, #0x1, lsl #16
++91:
++	str	w2, [x1], #4
++	subs	x3, x3, #1
++	b.ne	91b
++	dsb	sy
+ 
+ 	// Set low reset vector before attempting any loads
+ 	adrp	x0, EXT(LowExceptionVectorBase)@page
+@@ -645,6 +657,18 @@ Lkernelcache_base_found:
+  *	TPIDRRO_EL0 - CPU number
+  */
+ common_start:
++	// x1s bring-up: progress bar 1 (0xffffff00) at rows 80..159
++	movz	x1, #0x800
++	movk	x1, #0xf107, lsl #16
++	movz	w2, #0xff00
++	movk	w2, #0xffff, lsl #16
++	movz	x3, #0xc200
++	movk	x3, #0x1, lsl #16
++92:
++	str	w2, [x1], #4
++	subs	x3, x3, #1
++	b.ne	92b
++	dsb	sy
+ 
+ #if HAS_NEX_PG
+ 	mov x19, lr
+@@ -762,6 +786,18 @@ common_start:
+ 	PAC_INIT_KEY_STATE tmp=x0, tmp2=x1
+ #endif /* HAS_APPLE_PAC */
+ 
++	// x1s bring-up: progress bar 2 (0xff0000ff) at rows 160..239
++	movz	x0, #0x1000
++	movk	x0, #0xf10e, lsl #16
++	movz	w1, #0xff
++	movk	w1, #0xff00, lsl #16
++	movz	x2, #0xc200
++	movk	x2, #0x1, lsl #16
++93:
++	str	w1, [x0], #4
++	subs	x2, x2, #1
++	b.ne	93b
++	dsb	sy
+ 	// Enable caches, MMU, ROP and JOP
+ 	MOV64   x0, SCTLR_EL1_DEFAULT
+ 	MSR_SCTLR_EL1_X0
