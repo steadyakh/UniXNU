@@ -1,0 +1,159 @@
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index ac03c45..afdd623 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -475,9 +475,26 @@ ml_feature_supported(uint64_t feature_bit)
+  * Indicates whether we allow EL0 to read the virtual timebase (CNTVCT_EL0)
+  * as a continuous time source (e.g. from mach_continuous_time)
+  */
++/*
++ * x1s (Galaxy S20): 1 = the mach timebase is the 26 MHz counter presented as 24 MHz (pexpert/arm/pe_identify_machine.c).
++ * iOS 27 user space hard-codes Apple's 24 MHz in places (CoreAudio's host time: x * 125 / 3, ~90 sites; found by
++ * ios-guacamole on a 19.2 MHz phone), so every timebase read is scaled by 12/13, timer programming by 13/12, and EL0
++ * reads of the counter go through the kernel.
++ */
++int x1s_tb26 = 0;
++
++static inline uint64_t
++x1s_tb_down(uint64_t hw)
++{
++	return x1s_tb26 ? (hw / 13) * 12 + ((hw % 13) * 12) / 13 : hw;    /* floor(hw * 12 / 13), monotonic, no overflow */
++}
++
+ boolean_t
+ user_cont_hwclock_allowed(void)
+ {
++	if (x1s_tb26) {
++		return FALSE;           /* EL0 cannot scale the counter */
++	}
+ #if HAS_CONTINUOUS_HWCLOCK
+ 	return TRUE;
+ #else
+@@ -499,6 +516,9 @@ user_cont_hwclock_allowed(void)
+ uint8_t
+ user_timebase_type(void)
+ {
++	if (x1s_tb26) {
++		return USER_TIMEBASE_NONE;      /* mach_absolute_time takes the trap; direct reads are emulated (sleh.c) */
++	}
+ #if HAS_ACNTVCT
+ 	return USER_TIMEBASE_NOSPEC_APPLE;
+ #elif HAS_APPLE_GENERIC_TIMER
+@@ -2475,6 +2495,11 @@ ml_set_decrementer(uint32_t dec_value)
+ 
+ 	assert(ml_get_interrupts_enabled() == FALSE);
+ 	cdp->cpu_decrementer = dec_value;
++	if (x1s_tb26) {
++		/* 24 MHz ticks -> 26 MHz counter ticks, rounded up so the timer never fires early */
++		uint64_t ticks = ((uint64_t)dec_value * 13 + 11) / 12;
++		dec_value = ticks > 0xffffffffull ? 0xffffffffu : (uint32_t)ticks;
++	}
+ 
+ 	if (cdp->cpu_set_decrementer_func) {
+ 		cdp->cpu_set_decrementer_func(dec_value);
+@@ -2490,7 +2515,7 @@ ml_set_decrementer(uint32_t dec_value)
+ static inline uint64_t
+ speculative_timebase(void)
+ {
+-	return __builtin_arm_rsr64(KERNEL_CNTVCT_EL0);
++	return x1s_tb_down(__builtin_arm_rsr64(KERNEL_CNTVCT_EL0));
+ }
+ 
+ /**
+@@ -2618,6 +2643,10 @@ ml_get_decrementer(void)
+ 		dec = (uint32_t)wide_val;
+ 		assert(wide_val == (uint64_t)dec);
+ 	}
++	if (x1s_tb26) {
++		/* counter ticks (TVAL counts down through zero: signed) -> 24 MHz ticks */
++		dec = (uint32_t)(int32_t)(((int64_t)(int32_t)dec * 12) / 13);
++	}
+ 
+ 	return dec;
+ }
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 2e1fd7a..cb5d9cd 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -3020,6 +3020,44 @@ handle_mach_continuous_time_trap(arm_saved_state_t *state)
+ }
+ 
+ 
++/*
++ * x1s: with the 24 MHz timebase EL0 has no access to the generic timer (USER_TIMEBASE_NONE), so a direct MRS of the
++ * counter or its frequency traps here: answered in the kernel's 24 MHz units (CNTxCT(SS) = mach_absolute_time(),
++ * CNTFRQ = 24 MHz). ISS for EC 0x18: Op0 [21:20], Op2 [19:17], Op1 [16:14], CRn [13:10], Rt [9:5], CRm [4:1], read [0].
++ */
++#include <pexpert/pexpert.h>
++extern int x1s_tb26;
++static bool
++x1s_tb26_mrs(arm_saved_state_t *state, uint64_t esr)
++{
++	uint32_t iss = (uint32_t)ESR_ISS(esr);
++	unsigned op0 = (iss >> 20) & 3, op2 = (iss >> 17) & 7, op1 = (iss >> 14) & 7, crn = (iss >> 10) & 15;
++	unsigned rt = (iss >> 5) & 31, crm = (iss >> 1) & 15;
++	uint64_t v;
++
++	if (!x1s_tb26 || !(iss & 1) || op0 != 3 || op1 != 3 || crn != 14 || crm != 0) {
++		return false;
++	}
++	switch (op2) {
++	case 0:
++		v = gPEClockFrequencyInfo.timebase_frequency_hz;
++		break;
++	case 1:
++	case 2:
++	case 5:
++	case 6:
++		v = mach_absolute_time();
++		break;
++	default:
++		return false;
++	}
++	if (rt != 31) {
++		set_user_saved_state_reg(state, rt, (register_t)v);
++	}
++	add_saved_state_pc(state, 4);
++	return true;
++}
++
+ __attribute__((noreturn))
+ static void
+ handle_msr_trap(arm_saved_state_t *state, uint64_t esr)
+@@ -3037,6 +3075,10 @@ handle_msr_trap(arm_saved_state_t *state, uint64_t esr)
+ 		panic("MSR/MRS trap (ESR 0x%llx) from kernel", esr);
+ 	}
+ 
++	if (x1s_tb26_mrs(state, esr)) {
++		return;
++	}
++
+ 	COPYIN(get_saved_state_pc(state), (char *)&instr, sizeof(instr));
+ 	codes[1] = instr;
+ 
+diff --git a/pexpert/arm/pe_identify_machine.c b/pexpert/arm/pe_identify_machine.c
+index 937ce42..1a3b8fb 100644
+--- a/pexpert/arm/pe_identify_machine.c
++++ b/pexpert/arm/pe_identify_machine.c
+@@ -146,6 +146,21 @@ pe_identify_machine(boot_args * bootArgs)
+ 		}
+ 	}
+ 
++	/*
++	 * x1s (Galaxy S20): present the 26 MHz generic timer as Apple's 24 MHz (osfmk/arm64/machine_routines.c, x1s_tb26).
++	 * Boot-arg x1stb26=0 keeps the hardware rate.
++	 */
++	{
++		extern int x1s_tb26;
++		uint32_t on = 1;
++		PE_parse_boot_argn("x1stb26", &on, sizeof(on));
++		if (on && gPEClockFrequencyInfo.timebase_frequency_hz == 26000000) {
++			gPEClockFrequencyInfo.timebase_frequency_hz = 24000000;
++			gPEClockFrequencyInfo.dec_clock_rate_hz = 24000000;
++			x1s_tb26 = 1;
++		}
++	}
++
+ 	/* Set the num / den pairs form the hz values. */
+ 	gPEClockFrequencyInfo.bus_clock_rate_num = gPEClockFrequencyInfo.bus_clock_rate_hz;
+ 	gPEClockFrequencyInfo.bus_clock_rate_den = 1;
