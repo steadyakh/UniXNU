@@ -1,6 +1,6 @@
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
-@@ -1178,6 +1178,220 @@
+@@ -1178,6 +1178,215 @@
  }
  
  /*
@@ -14,11 +14,6 @@
 + *   RMIF, SETF8/16 (FlagM), SB, DIT, FJCVTZS (JavaScript's double -> int32).
 + * Anything else is logged (the first 64) and gets the usual EXC_BAD_INSTRUCTION, so new ones can be found.
 + */
-+struct proc;
-+extern struct proc *current_proc(void);
-+extern int proc_pid(struct proc *);
-+extern char *proc_best_name(struct proc *);
-+
 +#define X1S_PSR_N (1u << 31)
 +#define X1S_PSR_Z (1u << 30)
 +#define X1S_PSR_C (1u << 29)
@@ -208,8 +203,8 @@
 +	}
 +	if (x1s_undef_logged < 64) {
 +		x1s_undef_logged++;
-+		printf("x1s: undefined instruction %08x at %llx in %s[%d]\n", instr, pc, proc_best_name(current_proc()),
-+		    proc_pid(current_proc()));
++		printf("x1s: undefined instruction %08x at %llx
++", instr, pc);
 +	}
 +	return false;
 +next:
@@ -221,7 +216,7 @@
   * Uncategorized exceptions are a catch-all for general execution errors.
   * ARM64_TODO: For now, we assume this is for undefined instruction exceptions.
   */
-@@ -1252,6 +1466,11 @@
+@@ -1252,6 +1461,11 @@
  		} else {
  			panic("Undefined kernel instruction: pc=%p instr=%x", (void*)get_saved_state_pc(state), instr);
  		}

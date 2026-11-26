@@ -72,13 +72,14 @@ index ac03c45..afdd623 100644
  	return dec;
  }
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index 2e1fd7a..cb5d9cd 100644
+index 4d6c4b0..ff2c9b5 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
-@@ -3020,6 +3020,44 @@ handle_mach_continuous_time_trap(arm_saved_state_t *state)
+@@ -3015,7 +3015,45 @@ handle_mach_continuous_time_trap(arm_saved_state_t *state)
  }
  
  
+-__attribute__((noreturn))
 +/*
 + * x1s: with the 24 MHz timebase EL0 has no access to the generic timer (USER_TIMEBASE_NONE), so a direct MRS of the
 + * counter or its frequency traps here: answered in the kernel's 24 MHz units (CNTxCT(SS) = mach_absolute_time(),
@@ -117,10 +118,11 @@ index 2e1fd7a..cb5d9cd 100644
 +	return true;
 +}
 +
- __attribute__((noreturn))
++/* x1s: not noreturn: x1s_tb26_mrs() answers some traps and returns */
  static void
  handle_msr_trap(arm_saved_state_t *state, uint64_t esr)
-@@ -3037,6 +3075,10 @@ handle_msr_trap(arm_saved_state_t *state, uint64_t esr)
+ {
+@@ -3032,6 +3070,10 @@ handle_msr_trap(arm_saved_state_t *state, uint64_t esr)
  		panic("MSR/MRS trap (ESR 0x%llx) from kernel", esr);
  	}
  
