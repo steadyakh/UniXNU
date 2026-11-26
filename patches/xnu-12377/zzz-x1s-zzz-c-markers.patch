@@ -1,0 +1,84 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 6690846..d98041f 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -344,6 +344,22 @@ arm_auxkc_init(void *mh, void *base)
+  *		Function:		Runs on the boot CPU, once, on entry from iBoot.
+  */
+ 
++
++/* x1s bring-up: a progress bar on the S20's panel (1440 wide, a8r8g8b8), through the bootstrap V=P mapping of the
++ * framebuffer (start.s); only valid until arm_vm_init() replaces the bootstrap tables. */
++static void
++x1s_mark(unsigned idx, uint32_t color)
++{
++	volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)(0xF1000000ULL + (uint64_t)idx * 80 * 1440 * 4);
++	for (unsigned i = 0; i < 80 * 1440; i++) {
++		p[i] = color;
++	}
++	for (uintptr_t a = (uintptr_t)p; a < (uintptr_t)(p + 80 * 1440); a += 64) {
++		__asm__ volatile ("dc civac, %0" :: "r"(a) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
+ __startup_func
+ void
+ arm_init(
+@@ -368,6 +384,7 @@ arm_init(
+ 	reset_vector_vaddr = (vm_offset_t) &LowResetVectorBase;
+ #endif /* APPLEVIRTUALPLATFORM */
+ 
++	x1s_mark(3, 0xFF00FF00);    /* green: arm_init entered */
+ 	cpu_data_init(&BootCpuData);
+ #if defined(HAS_APPLE_PAC)
+ 	/* bootstrap cpu process dependent key for kernel has been loaded by start.s */
+@@ -376,6 +393,7 @@ arm_init(
+ #endif /* defined(HAS_APPLE_PAC) */
+ 
+ 	PE_init_platform(FALSE, args); /* Get platform expert set up */
++	x1s_mark(4, 0xFF00FFFF);    /* cyan: PE_init_platform(FALSE) done */
+ 
+ #if __arm64__
+ 	configure_timer_apple_regs();
+@@ -459,6 +477,7 @@ arm_init(
+ #endif
+ 
+ 	ml_parse_cpu_topology();
++	x1s_mark(5, 0xFFFF00FF);    /* magenta: CPU topology parsed */
+ 
+ 
+ 	boot_cpu_id = ml_get_boot_cpu_number();
+@@ -492,6 +511,7 @@ arm_init(
+ 	cpu_bootstrap();
+ 
+ 	rtclock_early_init();
++	x1s_mark(6, 0xFFFFFFFF);    /* white: timer set up */
+ 
+ 	kernel_debug_string_early("kernel_startup_bootstrap");
+ 	kernel_startup_bootstrap();
+@@ -569,6 +589,7 @@ arm_init(
+ 	gDramSize = *dram_size;
+ 	pmap_first_pnum = (ppnum_t)atop(gDramBase);
+ 
++	x1s_mark(7, 0xFFFF8000);    /* orange: about to set up VM */
+ 	arm_vm_init(xmaxmem, args);
+ 
+ 	if (debug_boot_arg) {
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index e9b1621..698e7c9 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -634,6 +634,12 @@ Lkernelcache_base_found:
+ 	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
+ 	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
+ 
++	/* x1s bring-up: the framebuffer V=P too (0xF1000000, 10 x 2 MB), so arm_init() can paint progress bars */
++	MOV64	x0, 0xF1000000
++	mov		x4, x0
++	mov		x5, #10
++	create_bootstrap_mapping x0,  x4,  x5, x1, x2, x6, x10, x11, x12, x13
++
+ 	/* Ensure TTEs are visible */
+ 	dsb		ish
+ 
