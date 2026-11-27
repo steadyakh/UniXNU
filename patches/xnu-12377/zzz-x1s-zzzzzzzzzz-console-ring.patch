@@ -1,0 +1,58 @@
+diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
+index 648cb70..55f45d3 100644
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -1227,9 +1227,14 @@ gc_update_color(int color, boolean_t fore)
+ 	gc_ops.update_color(color, fore);
+ }
+ 
++/* x1s bring-up: every character given to the video console, for the S20 loader's watcher (x1s_autoreset) */
++char x1s_cons_ring[32768] __attribute__((aligned(64)));
++uint32_t x1s_cons_ring_pos;
++
+ void
+ vcputc_options(char c, __unused bool poll)
+ {
++	x1s_cons_ring[x1s_cons_ring_pos++ & (sizeof(x1s_cons_ring) - 1)] = c;
+ 	if (gc_initialized && gc_enabled) {
+ 		VCPUTC_LOCK_LOCK();
+ 		if (gc_enabled) {
+diff --git a/osfmk/vm/vm_resident.c b/osfmk/vm/vm_resident.c
+index 8bebebb..a43083a 100644
+--- a/osfmk/vm/vm_resident.c
++++ b/osfmk/vm/vm_resident.c
+@@ -2246,6 +2246,7 @@ vm_page_bootstrap(
+ 	(void)pmap_free_pages();
+ 
+ 	kernel_startup_initialize_upto(STARTUP_SUB_PMAP_STEAL);
++	printf("x1s vmb: pmap_steal stage done, %u free pages\n", (unsigned)pmap_free_pages());
+ 
+ 	/*
+ 	 *	Allocate (and initialize) the virtual-to-physical
+@@ -2311,6 +2312,7 @@ vm_page_bootstrap(
+ #endif /* VM_PAGE_BUCKETS_CHECK */
+ 
+ 	kernel_debug_string_early("vm_page_buckets");
++	printf("x1s vmb: buckets %u, locks %u\n", vm_page_bucket_count, vm_page_bucket_lock_count);
+ 	vm_page_buckets = (vm_page_bucket_t *)
+ 	    pmap_steal_memory(vm_page_bucket_count *
+ 	    sizeof(vm_page_bucket_t), 0);
+@@ -2333,8 +2335,10 @@ vm_page_bootstrap(
+ 	for (i = 0; i < vm_page_bucket_lock_count; i++) {
+ 		hw_lck_ticket_init(&vm_page_bucket_locks[i], &vm_page_lck_grp_bucket);
+ 	}
++	printf("x1s vmb: buckets and locks set\n");
+ 
+ 	vm_tag_init();
++	printf("x1s vmb: vm_tag_init done\n");
+ 
+ #if VM_PAGE_BUCKETS_CHECK
+ 	vm_page_buckets_check_ready = TRUE;
+@@ -2639,6 +2643,7 @@ pmap_startup(
+ 	 * Initialize and release the page frames.
+ 	 */
+ 	kernel_debug_string_early("page_frame_init");
++	printf("x1s vmb: pmap_startup: page frames next\n");
+ 	absolutetime_to_nanoseconds(mach_absolute_time(), &start_ns);
+ 	if (fillval) {
+ 		kprintf("Filling vm_pages with pattern: 0x%x\n", fillval);
