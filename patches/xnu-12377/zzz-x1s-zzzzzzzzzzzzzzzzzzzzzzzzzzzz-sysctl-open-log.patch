@@ -1,0 +1,30 @@
+diff --git a/bsd/kern/kern_newsysctl.c b/bsd/kern/kern_newsysctl.c
+index 20d071c..ea154e8 100644
+--- a/bsd/kern/kern_newsysctl.c
++++ b/bsd/kern/kern_newsysctl.c
+@@ -2080,6 +2080,11 @@ sysctl(proc_t p, struct sysctl_args *uap, __unused int32_t *retval)
+ 	}
+ 
+ 	error = userland_sysctl(FALSE, namestring, namestringlen, name, uap->namelen, &req, &oldlen);
++	/* x1s: an unknown sysctl a process asks for (bring-up; x1s_systrace=N) */
++	if (error == ENOENT && proc_pid(p) <= 1) {
++		printf("x1s sysctl: %s[%d] unknown {%d,%d,%d,%d} n=%u '%s'\n", p->p_comm, proc_pid(p), name[0], uap->namelen > 1 ? name[1] : -1,
++		    uap->namelen > 2 ? name[2] : -1, uap->namelen > 3 ? name[3] : -1, uap->namelen, namestring ? namestring : "");
++	}
+ 
+ 	kfree_data(namestring, namestringlen);
+ 
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 942dc24..123b80e 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -4963,6 +4963,9 @@ open1(vfs_context_t ctx, struct nameidata *ndp, int uflags,
+ 	}
+ 
+ 	if ((error = vn_open_auth(ndp, &flags, vap, authvp))) {
++		if (error == ENOENT && proc_pid(p) <= 1 && ndp->ni_cnd.cn_pnbuf != NULL) {
++			printf("x1s open: %s[%d] no %s\n", p->p_comm, proc_pid(p), ndp->ni_cnd.cn_pnbuf);   /* x1s bring-up */
++		}
+ 		if (authvp != NULLVP) {
+ 			vnode_put(authvp);
+ 		}
