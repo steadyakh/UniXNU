@@ -1,0 +1,40 @@
+diff --git a/osfmk/vm/vm_resident.c b/osfmk/vm/vm_resident.c
+index a9501ed..7c80ec3 100644
+--- a/osfmk/vm/vm_resident.c
++++ b/osfmk/vm/vm_resident.c
+@@ -2507,6 +2507,9 @@ pmap_steal_memory_internal(
+ 		}
+ #endif
+ 
++		if (might_free && ((map_addr - round_page(addr)) / PAGE_SIZE) % 64 == 0) {
++			printf("x1s steal: va 0x%llx (page %llu)\n", (unsigned long long)map_addr, (unsigned long long)((map_addr - round_page(addr)) / PAGE_SIZE));
++		}
+ 		if (!pmap_next_page_hi(&phys_page, might_free)) {
+ 			panic("pmap_steal_memory() size: 0x%llx", (uint64_t)size);
+ 		}
+@@ -2525,6 +2528,9 @@ pmap_steal_memory_internal(
+ 		}
+ #endif /* HAS_MTE */
+ 
++		if (might_free && ((map_addr - round_page(addr)) / PAGE_SIZE) % 64 == 0) {
++			printf("x1s steal: phys page 0x%x, entering\n", phys_page);
++		}
+ 		kr = pmap_enter(kernel_pmap, map_addr, phys_page,
+ 		    VM_PROT_READ | VM_PROT_WRITE, VM_PROT_NONE,
+ 		    pmap_flags, FALSE, mapping_type);
+@@ -2645,6 +2651,7 @@ pmap_startup(
+ 	kernel_debug_string_early("page_frame_init");
+ 	printf("x1s vmb: pmap_startup: page frames next\n");
+ 	absolutetime_to_nanoseconds(mach_absolute_time(), &start_ns);
++	printf("x1s vmb: clock read\n");
+ 	if (fillval) {
+ 		kprintf("Filling vm_pages with pattern: 0x%x\n", fillval);
+ 	}
+@@ -2673,6 +2680,7 @@ pmap_startup(
+ 	npages  = (uint32_t)((mem_sz + divisor - 1) / divisor); /* scaled to include the vm_page_ts */
+ 
+ 
++	printf("x1s vmb: stealing 0x%llx bytes for %u vm_pages, va now 0x%llx\n", (unsigned long long)(npages * sizeof(struct vm_page)), npages, (unsigned long long)virtual_space_start);
+ 	vm_pages     = pmap_steal_freeable_memory(npages * sizeof(struct vm_page));
+ 	vm_pages_end = vm_page_get(npages);
+ 	{ uint64_t daif; __asm__ volatile ("mrs %0, DAIF" : "=r" (daif));
