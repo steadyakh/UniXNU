@@ -12,10 +12,10 @@ index a61c4fb..a9681e3 100644
  bsd/miscfs/apfs/apfs_lib.c		optional apfs
 diff --git a/bsd/kern/kern_minimac.c b/bsd/kern/kern_minimac.c
 new file mode 100644
-index 0000000..a24af83
+index 0000000..1413f99
 --- /dev/null
 +++ b/bsd/kern/kern_minimac.c
-@@ -0,0 +1,384 @@
+@@ -0,0 +1,385 @@
 +/*
 + * Stand-ins for the two closed security policies user space cannot do
 + * without: AMFI and the Sandbox. On a device they are kexts that register
@@ -56,6 +56,7 @@ index 0000000..a24af83
 +#include <mach/vm_param.h>
 +#include <vm/vm_kern_xnu.h>
 +#include <vm/vm_map.h>
++#include <vm/vm_map_xnu.h>
 +#include <security/mac_framework.h>
 +#include <security/mac_policy.h>
 +
