@@ -1,0 +1,37 @@
+diff --git a/osfmk/vm/vm_resident.c b/osfmk/vm/vm_resident.c
+index a43083a..a9501ed 100644
+--- a/osfmk/vm/vm_resident.c
++++ b/osfmk/vm/vm_resident.c
+@@ -2675,6 +2675,8 @@ pmap_startup(
+ 
+ 	vm_pages     = pmap_steal_freeable_memory(npages * sizeof(struct vm_page));
+ 	vm_pages_end = vm_page_get(npages);
++	{ uint64_t daif; __asm__ volatile ("mrs %0, DAIF" : "=r" (daif));
++	  printf("x1s vmb: vm_pages %p..%p, %u pages, mem_sz 0x%llx, DAIF 0x%llx\n", vm_pages, vm_pages_end, npages, (unsigned long long)mem_sz, (unsigned long long)daif); }
+ 
+ #if CONFIG_SECLUDED_MEMORY
+ 	/*
+@@ -2737,6 +2739,9 @@ pmap_startup(
+ 	vm_free_page_lock();
+ 
+ 	for (uint32_t i = 0; i < npages && pmap_next_page(&phys_page); i++) {
++		if ((i & 32767) == 0) {
++			printf("x1s vmb: init page %u (phys page 0x%x)\n", i, phys_page);
++		}
+ #if XNU_VM_HAS_DELAYED_PAGES
+ 		if (phys_page < max_valid_low_ppnum) {
+ 			++low_page_count;
+@@ -2783,9 +2788,13 @@ pmap_startup(
+ 	}
+ 
+ 	vm_page_pages = vm_pages_count; /* used to report to user space */
++	printf("x1s vmb: init loop done, %u pages, himemory %d\n", vm_pages_count, (int)vm_himemory_mode);
+ 
+ 	if (!vm_himemory_mode) {
+ 		for (uint32_t i = npages; i-- > 0;) {
++			if ((i & 32767) == 0) {
++				printf("x1s vmb: release page %u\n", i);
++			}
+ 			/* skip retired pages */
+ 			if (!VMP_ERROR_GET(vm_page_get(i))) {
+ 				vm_page_release_startup(vm_page_get(i));
