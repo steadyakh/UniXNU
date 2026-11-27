@@ -1,0 +1,26 @@
+diff --git a/bsd/kern/lockdown_mode.c b/bsd/kern/lockdown_mode.c
+index 1c104b3..d05c215 100644
+--- a/bsd/kern/lockdown_mode.c
++++ b/bsd/kern/lockdown_mode.c
+@@ -40,6 +40,21 @@ int lockdown_mode_state = 0;
+ SYSCTL_DECL(_security_mac);
+ SYSCTL_INT(_security_mac, OID_AUTO, lockdown_mode_state, CTLFLAG_RD | CTLFLAG_LOCKED, &lockdown_mode_state, 0, "Lockdown Mode state");
+ 
++/*
++ * x1s (ios-guacamole xnu12377-lockdown-public): Darwin 26 (iOS 27) libsystem_darwin's os_lockdown_mode_enabled()
++ * reads sysctlbyname("security.mac.lockdown_mode_state_public", u64) and crashes the caller when it does not exist;
++ * launchd calls it before its first spawn. Same value as lockdown_mode_state, as a 64-bit read-only integer.
++ */
++static int
++sysctl_lockdown_mode_state_public SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint64_t state = (uint64_t)lockdown_mode_state;
++	return SYSCTL_OUT(req, &state, sizeof(state));
++}
++SYSCTL_PROC(_security_mac, OID_AUTO, lockdown_mode_state_public, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_ANYBODY,
++    0, 0, sysctl_lockdown_mode_state_public, "Q", "Lockdown Mode state (public)");
++
+ __startup_func
+ void
+ lockdown_mode_init(void)
