@@ -13,7 +13,7 @@ index f54b5b0..a61c4fb 100644
  bsd/miscfs/apfs/apfs_lib.c		optional apfs
 diff --git a/bsd/miscfs/ramfs/ramfs.c b/bsd/miscfs/ramfs/ramfs.c
 new file mode 100644
-index 0000000..e3a4949
+index 0000000..201718d
 --- /dev/null
 +++ b/bsd/miscfs/ramfs/ramfs.c
 @@ -0,0 +1,1998 @@
@@ -64,7 +64,7 @@ index 0000000..e3a4949
 +#include <sys/xattr.h>
 +#include <uuid/uuid.h>
 +#include <vfs/vfs_support.h>
-+#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
 +
 +#define RAMFS_MAX_NAME          255
 +#define RAMFS_MAX_XATTR         (16u * 1024 * 1024)
