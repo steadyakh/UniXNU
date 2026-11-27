@@ -1,0 +1,32 @@
+diff --git a/osfmk/arm/pmap/pmap_data.c b/osfmk/arm/pmap/pmap_data.c
+index 9c758b0..f4d7cf3 100644
+--- a/osfmk/arm/pmap/pmap_data.c
++++ b/osfmk/arm/pmap/pmap_data.c
+@@ -25,6 +25,7 @@
+  *
+  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
+  */
++#include <kern/startup.h>
+ #include <arm/cpu_data_internal.h>
+ #include <kern/queue.h>
+ #include <libkern/OSAtomic.h>
+@@ -1377,6 +1378,19 @@ pmap_pages_alloc_zeroed(pmap_paddr_t *pa, unsigned size, unsigned options)
+ 		}
+ 	}
+ 
++	if (mem == VM_PAGE_NULL && size == PAGE_SIZE && startup_phase < STARTUP_SUB_KMEM) {
++		/* x1s: no free pages before pmap_startup() releases them: take one as pmap_steal_memory() does */
++		ppnum_t pn;
++
++		if (pmap_next_page_hi(&pn, FALSE)) {
++			*pa = (pmap_paddr_t)ptoa(pn);
++			vm_page_wire_count++;
++			vm_page_stolen_count++;
++			bzero((void*)phystokv(*pa), size);
++			return KERN_SUCCESS;
++		}
++	}
++
+ 	if (mem == VM_PAGE_NULL) {
+ 		return KERN_RESOURCE_SHORTAGE;
+ 	}
