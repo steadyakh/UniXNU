@@ -1,0 +1,15 @@
+diff --git a/osfmk/arm/pmap/pmap.h b/osfmk/arm/pmap/pmap.h
+index f9e841f..4ef8293 100644
+--- a/osfmk/arm/pmap/pmap.h
++++ b/osfmk/arm/pmap/pmap.h
+@@ -116,7 +116,9 @@
+  */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 34)
+ #else /* defined(ARM_LARGE_MEMORY) */
+-#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 8)
++/* x1s: 34 pages as for large memory (4K pages: one L2 table per GB; the S20 has 12 GB, and the framebuffer's V=P
++ * mapping needs a table of its own) */
++#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 34)
+ #endif /* defined(ARM_LARGE_MEMORY) */
+ 
+ typedef uint64_t tt_entry_t; /* translation table entry type */

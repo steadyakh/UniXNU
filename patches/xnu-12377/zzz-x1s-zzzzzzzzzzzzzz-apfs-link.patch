@@ -1,0 +1,19 @@
+diff --git a/bsd/miscfs/apfs/apfs_vnops.c b/bsd/miscfs/apfs/apfs_vnops.c
+index 8b662f1..118dd25 100644
+--- a/bsd/miscfs/apfs/apfs_vnops.c
++++ b/bsd/miscfs/apfs/apfs_vnops.c
+@@ -27,7 +27,13 @@
+ /* How much is read out of a file at a time when copying into a uio. */
+ 
+ extern integer_t thread_kern_get_pri(thread_t thr);    /* the thread's base priority */
+-extern void thread_runnable_and_run_self(uint64_t *runnable, uint64_t *run);
++/* x1s (xnu-12377): HakiOS's scheduler statistics are not here; the lock statistics then show 0 for them */
++static inline void
++thread_runnable_and_run_self(uint64_t *runnable, uint64_t *run)
++{
++	*runnable = 0;
++	*run = 0;
++}
+ 
+ /* The statistics of the calling process (with the lock held) */
+ static struct apfs_lock_proc *
