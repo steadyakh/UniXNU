@@ -1,0 +1,22 @@
+diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index 32bd5de..3385839 100644
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -5343,5 +5343,5 @@ extern "C" void MiniIOMobileFramebufferStart_c(void);
+ extern "C" void
+ MiniIOMobileFramebufferStart_c(void)
+ {
+-	MiniIOMobileFramebufferStart(IOService::getPlatform());
++	MiniIOMobileFramebufferStart((IOService *)(void *)IOService::getPlatform());
+ }
+diff --git a/iokit/Kernel/MiniIOSurface.cpp b/iokit/Kernel/MiniIOSurface.cpp
+index 19c153b..ee23c3a 100644
+--- a/iokit/Kernel/MiniIOSurface.cpp
++++ b/iokit/Kernel/MiniIOSurface.cpp
+@@ -2236,5 +2236,5 @@ extern "C" void MiniIOSurfaceStart_c(void);
+ extern "C" void
+ MiniIOSurfaceStart_c(void)
+ {
+-	MiniIOSurfaceStart(IOService::getPlatform());
++	MiniIOSurfaceStart((IOService *)(void *)IOService::getPlatform());
+ }
