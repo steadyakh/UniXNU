@@ -1,0 +1,20 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index c155a6f..23a2508 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -355,6 +355,7 @@ void x1s_thin_bar(unsigned row, uint32_t color);
+ void
+ x1s_thin_bar(unsigned row, uint32_t color)
+ {
++	color = 0xFF000000u | ((color >> 2) & 0x003F3F3Fu);   /* dim: OLED */
+ 	extern uintptr_t x1s_fb_addr(void);
+ 	if (row + 16 > 3200) {
+ 		return;
+@@ -383,6 +384,7 @@ x1s_fb_addr(void)
+ void
+ x1s_mark(unsigned idx, uint32_t color)
+ {
++	color = 0xFF000000u | ((color >> 2) & 0x003F3F3Fu);   /* dim: OLED */
+ 	volatile uint32_t *p = (volatile uint32_t *)(x1s_fb + (uint64_t)idx * 80 * 1440 * 4);
+ 	for (unsigned i = 0; i < 80 * 1440; i++) {
+ 		p[i] = color;
