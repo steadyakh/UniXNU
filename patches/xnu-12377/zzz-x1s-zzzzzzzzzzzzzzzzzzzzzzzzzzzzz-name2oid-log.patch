@@ -1,0 +1,19 @@
+diff --git a/bsd/kern/kern_newsysctl.c b/bsd/kern/kern_newsysctl.c
+index ea154e8..d3f073f 100644
+--- a/bsd/kern/kern_newsysctl.c
++++ b/bsd/kern/kern_newsysctl.c
+@@ -2085,6 +2085,14 @@ sysctl(proc_t p, struct sysctl_args *uap, __unused int32_t *retval)
+ 		printf("x1s sysctl: %s[%d] unknown {%d,%d,%d,%d} n=%u '%s'\n", p->p_comm, proc_pid(p), name[0], uap->namelen > 1 ? name[1] : -1,
+ 		    uap->namelen > 2 ? name[2] : -1, uap->namelen > 3 ? name[3] : -1, uap->namelen, namestring ? namestring : "");
+ 	}
++	/* x1s: which name a failing name2oid lookup was for */
++	if (error == ENOENT && proc_pid(p) <= 1 && uap->namelen == 2 && name[0] == 0 && name[1] == 3 && uap->new != USER_ADDR_NULL) {
++		char x1s_n[96] = { 0 };
++		size_t x1s_l = uap->newlen < sizeof(x1s_n) - 1 ? uap->newlen : sizeof(x1s_n) - 1;
++		if (copyin(uap->new, x1s_n, x1s_l) == 0) {
++			printf("x1s sysctl: %s[%d] name2oid('%s') not found\n", p->p_comm, proc_pid(p), x1s_n);
++		}
++	}
+ 
+ 	kfree_data(namestring, namestringlen);
+ 
