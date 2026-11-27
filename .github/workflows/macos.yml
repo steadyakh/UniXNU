@@ -105,6 +105,42 @@ jobs:
             printf '%-10s %s\n' "$tool" "$(command -v "$tool" || echo MISSING)"
           done
 
+      # x1s: keep the xnu work tree and its objects between runs, so that a run recompiles only what changed
+      # (build-xnu-12377.sh applies only patches that are not in the tree yet, and make rebuilds by time stamp).
+      - name: Restore the build tree
+        if: inputs.steps == 'kernel'
+        uses: actions/cache@v4
+        with:
+          path: |
+            out/*/tree/refer
+            out/*/tree/build
+            out/*/tree/.cache/xnu-12377.121.6-work
+            out/*/tree/.cache/xnu-12377.121.6-fakeroot
+            out/*/tree/.cache/xnu-12377.121.6-kdk
+            out/*/tree/.cache/kdk
+          key: xnu-tree-${{ inputs.defconfig }}-${{ hashFiles('patches/xnu-12377/*.patch') }}
+          restore-keys: |
+            xnu-tree-${{ inputs.defconfig }}-
+
+      - name: Drop a cached work tree whose patches changed
+        if: inputs.steps == 'kernel'
+        run: |
+          # A patch that changed or went away since the cached tree was made: start the work tree again (the objects
+          # stay; the re-applied sources are newer, so make recompiles them).
+          for W in out/*/tree/.cache/xnu-12377.121.6-work; do
+            [ -d "$W" ] || continue
+            S="$W/.x1s-applied"
+            fresh=
+            if [ ! -f "$S" ]; then fresh="no record of its patches"; else
+              while read -r h p; do
+                if [ ! -f "patches/xnu-12377/$p" ] || [ "$(shasum -a 256 "patches/xnu-12377/$p" | cut -d' ' -f1)" != "$h" ]; then
+                  fresh="patch $p changed or was removed"; break
+                fi
+              done < "$S"
+            fi
+            if [ -n "$fresh" ]; then echo "work tree $W: $fresh: starting it again"; rm -rf "$W"; else echo "work tree $W: reused"; fi
+          done
+
       - name: Select the device
         run: |
           ./unixnu defconfig "${{ inputs.defconfig }}" -D "$GITHUB_WORKSPACE/device"
@@ -150,6 +186,14 @@ jobs:
           args=()
           if [ -n "$IPSW_URL" ]; then args+=(--ipsw "$IPSW_URL"); fi
           ./unixnu build kernel "${args[@]}"
+          # x1s: record which patches the work tree has, for the next run's check
+          for W in out/*/tree/.cache/xnu-12377.121.6-work; do
+            [ -d "$W" ] || continue
+            : > "$W/.x1s-applied"
+            for p in patches/xnu-12377/*.patch; do
+              echo "$(shasum -a 256 "$p" | cut -d' ' -f1) $(basename "$p")" >> "$W/.x1s-applied"
+            done
+          done
 
       - name: Build userdata
         if: contains(inputs.steps, 'userdata')
