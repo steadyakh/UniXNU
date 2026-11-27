@@ -1,5 +1,5 @@
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index 29d7dbe..8f80014 100644
+index 29d7dbe..553a1c3 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
 @@ -94,6 +94,10 @@
@@ -13,7 +13,7 @@ index 29d7dbe..8f80014 100644
  
  #include <os/log.h>
  #include <os/system_event_log.h>
-@@ -923,6 +927,24 @@ exception_triage(
+@@ -923,6 +927,23 @@ exception_triage(
  
  	assert(codeCnt > 0);
  
@@ -22,7 +22,6 @@ index 29d7dbe..8f80014 100644
 +	if (task != kernel_task && (exception == EXC_BAD_ACCESS || exception == EXC_BAD_INSTRUCTION ||
 +	    exception == EXC_ARITHMETIC || exception == EXC_BREAKPOINT || exception == EXC_GUARD)) {
 +		struct arm_saved_state *x1s_st = get_user_regs(thread);
-+		extern char *proc_name_address(void *p);
 +		void *x1s_p = get_bsdtask_info(task);
 +		if (x1s_st != NULL) {
 +			printf("x1s exc: %s[%d] exception %d codes 0x%llx 0x%llx pc 0x%llx lr 0x%llx sp 0x%llx far 0x%llx esr 0x%x\n",
