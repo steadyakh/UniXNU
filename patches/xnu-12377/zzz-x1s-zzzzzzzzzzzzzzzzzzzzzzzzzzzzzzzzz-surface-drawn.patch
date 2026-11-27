@@ -1,0 +1,15 @@
+diff --git a/iokit/Kernel/MiniIOSurface.cpp b/iokit/Kernel/MiniIOSurface.cpp
+index ee23c3a..7324bbf 100644
+--- a/iokit/Kernel/MiniIOSurface.cpp
++++ b/iokit/Kernel/MiniIOSurface.cpp
+@@ -2238,3 +2238,10 @@ MiniIOSurfaceStart_c(void)
+ {
+ 	MiniIOSurfaceStart((IOService *)(void *)IOService::getPlatform());
+ }
++
++/* x1s: no GPU driver in this kernel yet (Jesvi's RedwoodGPU.cpp): every surface counts as drawn (software rendering) */
++bool
++MiniIOSurfaceDrawn(__unused MiniIOSurface * surface, __unused uint64_t milliseconds)
++{
++	return true;
++}
