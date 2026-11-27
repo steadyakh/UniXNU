@@ -1,0 +1,28 @@
+diff --git a/bsd/dev/x1s_mini_shim.c b/bsd/dev/x1s_mini_shim.c
+index 244f5d4..94b918f 100644
+--- a/bsd/dev/x1s_mini_shim.c
++++ b/bsd/dev/x1s_mini_shim.c
+@@ -63,22 +63,7 @@ redwood_dvfs_display(__unused int on)
+ {
+ }
+ 
+-bool
+-redwood_camera_dma_get(__unused uint64_t bytes, uint64_t *phys, void **virt)
+-{
+-	if (phys) {
+-		*phys = 0;
+-	}
+-	if (virt) {
+-		*virt = NULL;
+-	}
+-	return false;
+-}
+-
+-void
+-redwood_camera_dma_put(void)
+-{
+-}
++/* (redwood_camera_dma_get/put: MiniIOSurface.cpp has its own) */
+ 
+ void *
+ redwood_camera_dma_cached(void)
