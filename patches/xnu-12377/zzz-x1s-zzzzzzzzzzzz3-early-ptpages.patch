@@ -1,5 +1,5 @@
 diff --git a/osfmk/arm/pmap/pmap_data.c b/osfmk/arm/pmap/pmap_data.c
-index 9c758b0..f4d7cf3 100644
+index 9c758b0..a9f7584 100644
 --- a/osfmk/arm/pmap/pmap_data.c
 +++ b/osfmk/arm/pmap/pmap_data.c
 @@ -25,6 +25,7 @@
@@ -10,12 +10,14 @@ index 9c758b0..f4d7cf3 100644
  #include <arm/cpu_data_internal.h>
  #include <kern/queue.h>
  #include <libkern/OSAtomic.h>
-@@ -1377,6 +1378,19 @@ pmap_pages_alloc_zeroed(pmap_paddr_t *pa, unsigned size, unsigned options)
- 		}
- 	}
- 
-+	if (mem == VM_PAGE_NULL && size == PAGE_SIZE && startup_phase < STARTUP_SUB_KMEM) {
-+		/* x1s: no free pages before pmap_startup() releases them: take one as pmap_steal_memory() does */
+@@ -1329,6 +1330,21 @@ pmap_pages_alloc_zeroed(pmap_paddr_t *pa, unsigned size, unsigned options)
+ 	 * This field should only be modified by the local thread itself, so no lock
+ 	 * needs to be taken.
+ 	 */
++	/* x1s: before pmap_startup() the VM has no free pages and vm_page_grab() waits (on a wait queue that does not
++	 * exist yet): take the page as pmap_steal_memory() does */
++	if (size == PAGE_SIZE && startup_phase < STARTUP_SUB_KMEM && vm_page_free_count == 0) {
++		/* (only while no page has been released: after that the free list has them all) */
 +		ppnum_t pn;
 +
 +		if (pmap_next_page_hi(&pn, FALSE)) {
@@ -27,6 +29,6 @@ index 9c758b0..f4d7cf3 100644
 +		}
 +	}
 +
- 	if (mem == VM_PAGE_NULL) {
- 		return KERN_RESOURCE_SHORTAGE;
- 	}
+ 	const boolean_t thread_vm_privileged = set_vm_privilege(true);
+ 
+ 	if (__probable(size == PAGE_SIZE)) {
