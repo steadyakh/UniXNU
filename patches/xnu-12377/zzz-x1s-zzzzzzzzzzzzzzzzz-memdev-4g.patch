@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/memdev.c b/bsd/dev/memdev.c
-index d24535d..5eecc48 100644
+index d24535d..7ddcd74 100644
 --- a/bsd/dev/memdev.c
 +++ b/bsd/dev/memdev.c
 @@ -242,10 +242,10 @@ mdevrw(dev_t dev, struct uio *uio, __unused int ioflag)
@@ -54,3 +54,12 @@ index d24535d..5eecc48 100644
  	}
  
  #endif /* CONFIG_MEMDEV_INSECURE */
+@@ -760,7 +760,7 @@ mdevgetrange(int devid, uint64_t *base, uint64_t *size)
+ 	}
+ 
+ 	*base = mdev[devid].mdBase << 12;
+-	*size = mdev[devid].mdSize << 12;
++	*size = (uint64_t)mdev[devid].mdSize << 12;
+ 
+ 	/* make sure (base, size) is a valid range and will not overflow */
+ 	assert(*size < (UINT64_MAX - *base));
