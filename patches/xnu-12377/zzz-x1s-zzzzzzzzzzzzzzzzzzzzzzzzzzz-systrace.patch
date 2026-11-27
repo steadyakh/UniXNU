@@ -1,0 +1,37 @@
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+index 0906700..c1e7675 100644
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -180,6 +180,17 @@ unix_syscall(
+ 	AUDIT_SYSCALL_ENTER(code, proc, uthread);
+ 	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
+ 	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
++	/* x1s: boot-arg x1s_systrace=N: failing system calls of processes with pid <= N on the console (bring-up) */
++	{
++		static int x1s_systrace = -1;
++		if (x1s_systrace < 0) {
++			int v = 0;
++			x1s_systrace = PE_parse_boot_argn("x1s_systrace", &v, sizeof(v)) ? v : 0;
++		}
++		if (x1s_systrace > 0 && error != 0 && error != EJUSTRETURN && error != ERESTART && pid <= x1s_systrace) {
++			printf("x1s sys: %s[%d] syscall %d error %d\n", proc->p_comm, pid, code, error);
++		}
++	}
+ 
+ #if CONFIG_MACF
+ skip_syscall:
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index f96acaf..f9fdedf 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -683,7 +683,9 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	{
+ 		extern void MiniAppleKeyStoreStart_c(void);
+ 		static bool x1s_keystore_started;
+-		if (!x1s_keystore_started) {
++		int x1s_ks = 1;
++		PE_parse_boot_argn("x1s_keystore", &x1s_ks, sizeof(x1s_ks));   /* x1s_keystore=0: none (test) */
++		if (!x1s_keystore_started && x1s_ks) {
+ 			x1s_keystore_started = true;
+ 			MiniAppleKeyStoreStart_c();
+ 		}
