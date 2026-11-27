@@ -1,0 +1,46 @@
+diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index f21ab6e..f3367e7 100644
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -4563,23 +4563,19 @@ MiniIOMobileFramebufferStart(IOService * provider)
+ {
+ 	IOMobileFramebuffer * fb = OSTypeAlloc(IOMobileFramebuffer);
+ 
+-	IOLog("x1s fb: start (provider %p)
+-", provider);
++	IOLog("x1s fb: start (provider %p)\n", provider);
+ 	if (fb == NULL || !fb->init() || !fb->attach(provider)) {
+-		IOLog("x1s fb: alloc/init/attach failed (fb %p)
+-", fb);
++		IOLog("x1s fb: alloc/init/attach failed (fb %p)\n", fb);
+ 		OSSafeReleaseNULL(fb);
+ 		return;
+ 	}
+ 	if (fb->start(provider)) {
+-		IOLog("x1s fb: started
+-");
++		IOLog("x1s fb: started\n");
+ 		publishDisplayNode();
+ 		publishBacklight(fb);
+ 		publishAccelerator(provider);
+ 	} else {
+-		IOLog("x1s fb: start() failed
+-");
++		IOLog("x1s fb: start() failed\n");
+ 		fb->detach(provider);
+ 	}
+ 	fb->release();
+diff --git a/iokit/Kernel/MiniIOSurface.cpp b/iokit/Kernel/MiniIOSurface.cpp
+index eac2424..7867629 100644
+--- a/iokit/Kernel/MiniIOSurface.cpp
++++ b/iokit/Kernel/MiniIOSurface.cpp
+@@ -1093,8 +1093,7 @@ MiniIOSurfaceStart(IOService * provider)
+ {
+ 	IOCoreSurfaceRoot * root;
+ 
+-	IOLog("x1s surface: start (provider %p)
+-", provider);
++	IOLog("x1s surface: start (provider %p)\n", provider);
+ 	gSurfaceLock = IOLockAlloc();
+ 	gSurfaceKeptLock = IOLockAlloc();
+ 	if (!PE_parse_boot_arg_str("surftrace_of", gSurfaceTraceOf, sizeof(gSurfaceTraceOf))) {
