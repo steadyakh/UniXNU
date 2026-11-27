@@ -47,6 +47,11 @@ if [ "$(git -C "$WORK" rev-parse HEAD)" != "$XNU_COMMIT" ]; then
 fi
 # Apply the series in name order; a patch that is already in the tree is skipped.
 for PATCH in "$PATCHES"/*.patch; do
+  # x1s (CI build cache): a patch recorded with the same contents in the cached tree is in it already (the reverse
+  # check fails for an early patch whose lines later patches changed again)
+  if [ -f "$WORK/.x1s-applied" ] && grep -qx "$(shasum -a 256 "$PATCH" | cut -d' ' -f1) $(basename "$PATCH")" "$WORK/.x1s-applied"; then
+    continue
+  fi
   if ! git -C "$WORK" apply --reverse --check "$PATCH" >/dev/null 2>&1; then
     git -C "$WORK" apply --check "$PATCH"
     git -C "$WORK" apply "$PATCH"
