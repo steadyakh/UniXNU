@@ -1,0 +1,4209 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 5bf792e..09a144a 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -156,6 +156,8 @@ bsd/miscfs/ramfs/ramfs.c		optional ramfs
+ bsd/vfs/x1s_switch_root.c		standard
+ bsd/kern/kern_minimac.c		optional config_macf
+ bsd/dev/x1s_mini_shim.c		standard
++bsd/dev/hakios.mali.c		standard
++bsd/dev/x1s_gpu_glue.c		standard
+ bsd/miscfs/apfs/apfs_deflate.c		optional apfs
+ bsd/miscfs/apfs/apfs_zbitmap.c		optional apfs
+ bsd/miscfs/apfs/apfs_lib.c		optional apfs
+diff --git a/bsd/dev/hakios.mali.c b/bsd/dev/hakios.mali.c
+new file mode 100644
+index 0000000..c2aeb70
+--- /dev/null
++++ b/bsd/dev/hakios.mali.c
+@@ -0,0 +1,2307 @@
++/*
++ * The Samsung Exynos990's (Galaxy S20's) GPU, an Arm Mali-G77 (Valhall, the "job manager" kind: no firmware to load),
++ * woken step by step and given one piece of work: devices/x1s/PLAN.md "GPU (Mali-G77)", step G3. Only with boot-arg
++ * mali=N, and only on this phone: every address below is the Exynos990's.
++ *
++ * The steps (mali=N does the first N of them, then gives back whatever it switched on):
++ *   1  look, without writing anything: the G3D power domain (PMU), the GPU's clock as the firmware left it, the GPU's
++ *      temperature, and -- when the domain is on -- the Mali's identity and what it has (cores, address spaces, job
++ *      slots, how many address bits its MMU takes). When the domain is off the steps end here: switching it on is
++ *      step G2 of the plan (Samsung's way, through a secure call and the APM), not done here.
++ *   2  a soft reset of the GPU, its interrupts masked (nothing here takes interrupts: everything is asked for)
++ *   3  the L2 cache, the tiler and the shader cores powered on through the GPU's own power registers, after the G3D
++ *      temperature has been read and found below mali_hot
++ *   4  one address space of the GPU's own MMU (AS 0): a four-level table in the AArch64 4K format, 16K of GPU
++ *      addresses at 0x1000000 mapped onto one page of ours, uncached for the GPU
++ *   5  one job: a WRITE_VALUE job (the simplest there is: it writes a number into memory) on job slot 1, and the
++ *      number looked for in memory
++ * After the last step the shader cores, the tiler and the L2 are powered off again (what S-BOOT left: off) and the
++ * system goes on starting. The GPU's clock is not touched: it runs at what the firmware left (read and said in step 1).
++ *
++ * Register layouts: Linux's drivers/gpu/drm/panfrost (panfrost_regs.h, panfrost_gpu.c, panfrost_mmu.c,
++ * panfrost_job.c) and Arm's kbase (mali_kbase_gpu_regmap.h, mali_kbase_mmu_mode_aarch64.c, mali_kbase_jm_hw.c, which
++ * Samsung ships for this phone); the job's layout: Mesa's src/panfrost/lib/genxml/v9.xml ("Job Header", "Write Value
++ * Job Payload"). The Mali at 0x18500000 and its power domain pd-embedded_g3d (PMU 0x15862200, status +4 bit 0): the
++ * phone's device tree. Read on the phone (U-Boot's gpucheck, test 25): domain on, GPU_ID 0x90800011 (G77 r0p1),
++ * SHADER_PRESENT 0x670077 (11 cores), 21 C.
++ *
++ * Status: WRITTEN, not yet run on the phone.
++ *
++ * Boot-args:
++ *   mali=N             the first N steps (1: read only; 5: everything)
++ *   mali_hot=C         no power on, and the cores off at once, at or above this G3D temperature (30 to 60; 50)
++ *   mali_tz=1          when step 2 finds that our writes do not reach the GPU: the secure call Samsung makes after the
++ *                      G3D domain comes on (its protection restored, tz_restore()), then the write test again
++ *   mali_cycle=1       when step 2 finds that our writes do not reach the GPU: the G3D domain switched off and on
++ *                      again exactly as Samsung's kernel does (domain_cycle()); left off at the end, Samsung's way
++ *   mali_clk=1         when step 2 finds that our writes do not reach the GPU: its clock started as Samsung's power-on
++ *                      of the domain does (clock_start()), the write test again; all of it undone at the end
++ *   mali_return=1      after the steps, back to the loader instead of starting the system
++ */
++#include <stdbool.h>
++#include <stdint.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/sched_prim.h>
++#include <kern/startup.h>
++#include <kern/thread.h>
++#include <kern/thread_call.h>
++#include <machine/machine_routines.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <mach/vm_param.h>
++#include <pexpert/pexpert.h>
++#include <sys/hakios.input.h>
++#include <sys/systm.h>
++#include <vm/vm_kern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern uint64_t kvtophys(vm_offset_t va);
++extern void loader_log_putc(char c);
++extern void loader_return(void);
++
++static int say(const char *format, ...) __printflike(1, 2);
++
++static int
++say(const char *format, ...)
++{
++	char line[256];
++	va_list list;
++
++	va_start(list, format);
++	vsnprintf(line, sizeof(line), format, list);
++	va_end(list);
++	for (const char *c = line; *c != 0; c++) {
++		loader_log_putc(*c);
++	}
++	return printf("%s", line);
++}
++
++/* ---- where things are ------------------------------------------------------------------------------ */
++
++#define MALI_PA                 0x18500000u
++#define MALI_SIZE               0x5000u
++#define PMU_G3D_PA              0x15862000u     /* the page; the domain's CONFIGURATION at +0x200, STATUS +0x204 */
++#define PMU_G3D_CONFIGURATION   0x200u
++#define PMU_G3D_STATUS          0x204u          /* bit 0: on (the Mali driver's gpu_pmu_status_reg_offset 0x2204) */
++#define CMU_TOP_PA              0x1a330000u
++#define PLL_CON0_PLL_G3D        0x100u          /* bit 4: the mux after the PLL takes the PLL (1) or the crystal (0) */
++#define PLL_CON3_PLL_G3D        0x10cu          /* bit 31 on, bit 29 locked, M [25:16], P [13:8], S [2:0] */
++#define G3D_ZONE                3               /* the APM's temperature zone of the GPU */
++#define ACPM_CH_DVFS            5               /* the device tree's acpm_dvfs */
++#define ACPM_DVFS_G3D           10              /* g3d_cmu_cal_id 0xb04000a: ACPM clock, index 0xa */
++#define ACPM_FREQ_GET           1               /* Samsung's cal-if/acpm_dvfs.h (FREQ_REQ is 0) */
++
++/* the GPU's control block */
++#define GPU_ID                  0x000
++#define L2_FEATURES             0x004
++#define CORE_FEATURES           0x008
++#define TILER_FEATURES          0x00c
++#define MEM_FEATURES            0x010
++#define MMU_FEATURES            0x014           /* [7:0] address bits the MMU takes in, [15:8] physical address bits */
++#define AS_PRESENT              0x018
++#define JS_PRESENT              0x01c
++#define GPU_IRQ_RAWSTAT         0x020
++#define GPU_IRQ_CLEAR           0x024
++#define GPU_IRQ_MASK            0x028
++#define GPU_COMMAND             0x030
++#define GPU_STATUS              0x034
++#define LATEST_FLUSH            0x038
++#define GPU_FAULTSTATUS         0x03c
++#define GPU_FAULTADDRESS_LO     0x040
++#define SHADER_PRESENT_LO       0x100
++#define SHADER_PRESENT_HI       0x104
++#define TILER_PRESENT_LO        0x110
++#define L2_PRESENT_LO           0x120
++#define SHADER_READY_LO         0x140
++#define SHADER_READY_HI         0x144
++#define TILER_READY_LO          0x150
++#define L2_READY_LO             0x160
++#define SHADER_PWRON_LO         0x180
++#define SHADER_PWRON_HI         0x184
++#define TILER_PWRON_LO          0x190
++#define L2_PWRON_LO             0x1a0
++#define SHADER_PWROFF_LO        0x1c0
++#define SHADER_PWROFF_HI        0x1c4
++#define TILER_PWROFF_LO         0x1d0
++#define L2_PWROFF_LO            0x1e0
++#define SHADER_PWRTRANS_LO      0x200
++#define TILER_PWRTRANS_LO       0x210
++#define L2_PWRTRANS_LO          0x220
++#define COHERENCY_FEATURES      0x300
++#define COHERENCY_ENABLE        0x304
++
++#define GPU_IRQ_FAULT           (1u << 0)
++#define GPU_IRQ_RESET_COMPLETED (1u << 8)
++#define GPU_CMD_SOFT_RESET      0x01
++
++/* job control */
++#define JOB_IRQ_RAWSTAT         0x1000          /* bit n: slot n done; bit 16 + n: slot n failed */
++#define JOB_IRQ_CLEAR           0x1004
++#define JOB_IRQ_MASK            0x1008
++#define JS(n)                   (0x1800 + 0x80 * (n))
++#define JS_HEAD_LO              0x00
++#define JS_HEAD_HI              0x04
++#define JS_COMMAND              0x20
++#define JS_STATUS               0x24
++#define JS_HEAD_NEXT_LO         0x40
++#define JS_HEAD_NEXT_HI         0x44
++#define JS_AFFINITY_NEXT_LO     0x50
++#define JS_AFFINITY_NEXT_HI     0x54
++#define JS_CONFIG_NEXT          0x58
++#define JS_COMMAND_NEXT         0x60
++#define JS_COMMAND_START        0x01
++#define JS_COMMAND_HARD_STOP    0x03
++#define JS_CONFIG_START_FLUSH_CLEAN_INVALIDATE (3u << 8)
++#define JS_CONFIG_END_FLUSH_CLEAN_INVALIDATE   (3u << 12)
++#define JS_CONFIG_THREAD_PRI(n) ((uint32_t)(n) << 16)
++#define JOB_SLOT                1               /* where Linux's panfrost puts what is not a fragment job */
++
++/* the MMU */
++#define MMU_IRQ_RAWSTAT         0x2000          /* bit n: AS n page fault; bit 16 + n: AS n bus error */
++#define MMU_IRQ_CLEAR           0x2004
++#define MMU_IRQ_MASK            0x2008
++#define AS(n)                   (0x2400 + 0x40 * (n))
++#define AS_TRANSTAB_LO          0x00
++#define AS_TRANSTAB_HI          0x04
++#define AS_MEMATTR_LO           0x08
++#define AS_MEMATTR_HI           0x0c
++#define AS_COMMAND              0x18
++#define AS_FAULTSTATUS          0x1c
++#define AS_FAULTADDRESS_LO      0x20
++#define AS_FAULTADDRESS_HI      0x24
++#define AS_STATUS               0x28            /* bit 0: a command still being carried out */
++#define AS_TRANSCFG_LO          0x30
++#define AS_TRANSCFG_HI          0x34
++#define AS_COMMAND_UPDATE       0x01
++#define AS_TRANSCFG_ADRMODE_AARCH64_4K  6u
++#define AS_TRANSCFG_PTW_NON_CACHEABLE   (1u << 24)      /* the table walk reads memory, not the GPU's L2 */
++/* every one of the eight memory kinds: inner and outer non-cacheable (panfrost's mair_to_memattr for device memory) */
++#define AS_MEMATTR_NON_CACHEABLE        0x4c4c4c4cu
++
++/* an entry of the tables (kbase's mmu_mode_aarch64.c) */
++#define PTE_TABLE               3ull            /* levels 0-2: the next table */
++#define PTE_PAGE                3ull            /* level 3: a 4K page */
++#define PTE_ACCESS_RW           (1ull << 6)
++#define PTE_ACCESS_FLAG         (1ull << 10)
++#define PTE_NX                  (1ull << 54)
++#define PTE_ADDRESS             0x0000fffffffff000ull
++
++#define GPU_VA                  0x1000000ull    /* where the GPU sees our page */
++
++/* ---- register access: one plain load or store each (the hypervisor may stand between) ------------- */
++
++static vm_offset_t mali, pmu, cmu_top;
++static uint32_t last_step, hot_c = 50;
++static uint64_t shader_present;
++static uint32_t tiler_present, l2_present, js_present, as_present, pa_bits;
++static bool powered;
++
++/*
++ * THE WAY IN (13 Nov, runs 57-69). Samsung's hypervisor (H-Arx, EL2) handles the kernel's stores to the GPU, its
++ * power-domain page and its clock pages in software, and for stores made through the kernel's own (TTBR1) mappings
++ * it drops them: reads come back right, writes never arrive -- from the first C code on; U-Boot's, the loader's and
++ * the kernel's MMU-off stores (start.s) all land. Through a table of our own in TTBR0, for the moment of the access,
++ * every store tried landed (runs 60-63, 65). So every access to those blocks goes that way here: a private lower-half
++ * window at LOW_BASE (4K pages, Device-nGnRnE: the kernel's MAIR index 3), entered with interrupts off, TTBR0 put back
++ * and this core's TLB emptied around each access. Slow (two TLB flushes per access) but sure; a few dozen accesses
++ * per GPU job.
++ *
++ * Faster (13 Nov, after run 79): an access empties only the TLB's entry for its own page (tlbi vaae1: that page, any
++ * ASID, its table walk too) instead of the whole TLB of this core twice -- every look at whether a job is done was
++ * two whole flushes, a few thousand a second while CoreAnimation draws, and every program on the core paid for them
++ * in refills. Loads need the window as much as stores: through a kernel (TTBR1) mapping of the power-domain page,
++ * every load gave back what the destination register held before, its own address (run 82: "configuration
++ * 0x40005200") -- the hypervisor skips them too. Boot-arg mali_slow=1: the whole flushes, as before.
++ */
++#define LOW_BASE                0x40000000ull
++#define LOW_PAGES               32
++
++static uint64_t low_l1[512] __attribute__((aligned(4096)));
++static uint64_t low_l2[512] __attribute__((aligned(4096)));
++static uint64_t low_l3[512] __attribute__((aligned(4096)));
++static uint64_t low_l1pa;
++static uint32_t low_next;
++static uint32_t low_slow;                       /* mali_slow=1: whole TLB flushes around each access */
++
++static void
++low_flush(void *start, size_t size)
++{
++	for (uintptr_t line = (uintptr_t)start & ~(uintptr_t)63; line < (uintptr_t)start + size; line += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
++	}
++	__asm__ volatile ("dsb sy" : : : "memory");
++}
++
++/* `pages` 4K pages of device registers from `pa` into the window: the VA that stands for `pa` there, or 0 */
++static vm_offset_t
++low_map(uint64_t pa, uint32_t pages)
++{
++	vm_offset_t va;
++
++	if (low_l1pa == 0) {
++		(void)PE_parse_boot_argn("mali_slow", &low_slow, sizeof(low_slow));
++		low_l1[1] = kvtophys((vm_offset_t)low_l2) | 3;          /* VA 0x40000000: level-1 entry 1 */
++		low_l2[0] = kvtophys((vm_offset_t)low_l3) | 3;
++		low_flush(low_l1, sizeof(low_l1));
++		low_flush(low_l2, sizeof(low_l2));
++		low_l1pa = kvtophys((vm_offset_t)low_l1);
++	}
++	if (low_next + pages > LOW_PAGES) {
++		return 0;
++	}
++	va = (vm_offset_t)(LOW_BASE + 4096ull * low_next + (pa & 0xfff));
++	for (uint32_t i = 0; i < pages; i++) {
++		low_l3[low_next++] = ((pa & ~0xfffull) + 4096ull * i) | 3ull << 2 | 1ull << 10 | 1ull << 53 | 1ull << 54 | 3;
++	}
++	low_flush(low_l3, sizeof(low_l3));
++	return va;
++}
++
++static inline bool
++in_low(vm_offset_t address)
++{
++	return low_l1pa != 0 && address >= LOW_BASE && address < LOW_BASE + 4096ull * LOW_PAGES;
++}
++
++/* A load through the window, emptying only its page's TLB entry (any ASID) before and after: see above. */
++static uint32_t __attribute__((noinline))
++low_load(vm_offset_t address)
++{
++	boolean_t was = ml_set_interrupts_enabled(FALSE);
++	uint64_t old0, got = 0, page = ((uint64_t)address >> 12) & 0xfffffffffffull;
++
++	__asm__ volatile ("mrs %0, ttbr0_el1" : "=r" (old0));
++	__asm__ volatile (
++	    "  dsb sy\n"
++	    "  msr ttbr0_el1, %[t]\n"
++	    "  isb\n"
++	    "  tlbi vaae1, %[p]\n"
++	    "  dsb sy\n"
++	    "  isb\n"
++	    "  ldr %w[g], [%[a]]\n"
++	    "  dsb sy\n"
++	    "  msr ttbr0_el1, %[o]\n"
++	    "  isb\n"
++	    "  tlbi vaae1, %[p]\n"
++	    "  dsb sy\n"
++	    "  isb\n"
++	    : [g] "=&r" (got) : [t] "r" (low_l1pa), [a] "r" (address), [o] "r" (old0), [p] "r" (page) : "memory");
++	(void)ml_set_interrupts_enabled(was);
++	return (uint32_t)got;
++}
++
++/* A store through the window, the same way. */
++static void __attribute__((noinline))
++low_store(vm_offset_t address, uint32_t value)
++{
++	boolean_t was = ml_set_interrupts_enabled(FALSE);
++	uint64_t old0, page = ((uint64_t)address >> 12) & 0xfffffffffffull;
++
++	__asm__ volatile ("mrs %0, ttbr0_el1" : "=r" (old0));
++	__asm__ volatile (
++	    "  dsb sy\n"
++	    "  msr ttbr0_el1, %[t]\n"
++	    "  isb\n"
++	    "  tlbi vaae1, %[p]\n"
++	    "  dsb sy\n"
++	    "  isb\n"
++	    "  str %w[v], [%[a]]\n"
++	    "  dsb sy\n"
++	    "  msr ttbr0_el1, %[o]\n"
++	    "  isb\n"
++	    "  tlbi vaae1, %[p]\n"
++	    "  dsb sy\n"
++	    "  isb\n"
++	    : : [t] "r" (low_l1pa), [v] "r" (value), [a] "r" (address), [o] "r" (old0), [p] "r" (page) : "memory");
++	(void)ml_set_interrupts_enabled(was);
++}
++
++static uint32_t __attribute__((noinline))
++low_access(vm_offset_t address, uint32_t value, bool write)
++{
++	boolean_t was;
++	uint64_t old0, got = 0;
++
++	if (!low_slow) {
++		if (write) {
++			low_store(address, value);
++			return 0;
++		}
++		return low_load(address);
++	}
++	was = ml_set_interrupts_enabled(FALSE);
++	__asm__ volatile ("mrs %0, ttbr0_el1" : "=r" (old0));
++	if (write) {
++		__asm__ volatile (
++		    "  dsb sy\n"
++		    "  msr ttbr0_el1, %[t]\n"
++		    "  isb\n"
++		    "  tlbi vmalle1\n"
++		    "  dsb sy\n"
++		    "  isb\n"
++		    "  str %w[v], [%[a]]\n"
++		    "  dsb sy\n"
++		    "  msr ttbr0_el1, %[o]\n"
++		    "  isb\n"
++		    "  tlbi vmalle1\n"
++		    "  dsb sy\n"
++		    "  isb\n"
++		    : : [t] "r" (low_l1pa), [v] "r" (value), [a] "r" (address), [o] "r" (old0) : "memory");
++	} else {
++		__asm__ volatile (
++		    "  dsb sy\n"
++		    "  msr ttbr0_el1, %[t]\n"
++		    "  isb\n"
++		    "  tlbi vmalle1\n"
++		    "  dsb sy\n"
++		    "  isb\n"
++		    "  ldr %w[g], [%[a]]\n"
++		    "  dsb sy\n"
++		    "  msr ttbr0_el1, %[o]\n"
++		    "  isb\n"
++		    "  tlbi vmalle1\n"
++		    "  dsb sy\n"
++		    "  isb\n"
++		    : [g] "=&r" (got) : [t] "r" (low_l1pa), [a] "r" (address), [o] "r" (old0) : "memory");
++	}
++	(void)ml_set_interrupts_enabled(was);
++	return (uint32_t)got;
++}
++
++static uint32_t __attribute__((noinline))
++rd(vm_offset_t address)
++{
++	uint32_t value;
++
++	if (in_low(address)) {
++		return low_access(address, 0, false);
++	}
++	__asm__ volatile ("ldr %w0, [%1]" : "=r" (value) : "r" (address) : "memory");
++	return value;
++}
++
++static void __attribute__((noinline))
++wr(vm_offset_t address, uint32_t value)
++{
++	if (in_low(address)) {
++		(void)low_access(address, value, true);
++		return;
++	}
++	__asm__ volatile ("dsb sy; str %w0, [%1]; dsb sy" : : "r" (value), "r" (address) : "memory");
++}
++
++#define G(reg)          rd(mali + (reg))
++#define P(reg, value)   wr(mali + (reg), (value))
++
++/* until (register & mask) == want, at most ms milliseconds: true if it came */
++static bool
++wait_for(uint32_t reg, uint32_t mask, uint32_t want, uint32_t ms)
++{
++	for (uint32_t us = 0; us <= ms * 1000; us += 10) {
++		if ((G(reg) & mask) == want) {
++			return true;
++		}
++		delay_for_interval(10, NSEC_PER_USEC);
++	}
++	return (G(reg) & mask) == want;
++}
++
++/* Push what this processor wrote out of its cache to memory, and forget it: the GPU reads and writes memory. */
++static void
++to_memory(vm_offset_t start, vm_size_t size)
++{
++	for (vm_offset_t line = start & ~(vm_offset_t)63; line < start + size; line += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
++	}
++	__asm__ volatile ("dsb sy" : : : "memory");
++}
++
++/* the G3D temperature, or -1: from the heat guard (hakios.exynos_thermal.c), which must be running */
++static int
++g3d_celsius(void)
++{
++	return hakios_exynos_temperature(G3D_ZONE);
++}
++
++static bool
++cool_enough(const char *before)
++{
++	int t = g3d_celsius();
++
++	if (t < 0) {
++		say("mali: no G3D temperature (is exynos_thermal=1 given?): nothing powered on %s\n", before);
++		return false;
++	}
++	if (t >= (int)hot_c) {
++		say("mali: G3D at %d C, at or above mali_hot=%u: nothing powered on %s\n", t, hot_c, before);
++		return false;
++	}
++	say("mali: G3D at %d C (limit %u C)\n", t, hot_c);
++	return true;
++}
++
++/* ---- step 1: look -------------------------------------------------------------------------------- */
++
++static bool
++step_look(void)
++{
++	uint32_t con0 = rd(cmu_top + PLL_CON0_PLL_G3D), con3 = rd(cmu_top + PLL_CON3_PLL_G3D);
++	uint32_t m = (con3 >> 16) & 0x3ff, p = (con3 >> 8) & 0x3f, s = con3 & 7;
++	uint32_t status = rd(pmu + PMU_G3D_STATUS), id;
++
++	say("mali: G3D domain: configuration %#x, status %#x (%s)\n", rd(pmu + PMU_G3D_CONFIGURATION), status,
++	    (status & 1) ? "on" : "OFF");
++	say("mali: G3D PLL: con0 %#x con3 %#x: %s, %s, %u MHz from 26 MHz (M %u P %u S %u); the mux after it takes %s\n",
++	    con0, con3, (con3 >> 31) ? "on" : "off", (con3 >> 29 & 1) ? "locked" : "not locked",
++	    p ? (uint32_t)(26ull * m / ((uint64_t)p << s)) : 0, m, p, s, (con0 >> 4 & 1) ? "the PLL" : "the crystal");
++	say("mali: G3D temperature: %d C\n", g3d_celsius());
++	/*
++	 * Samsung's power-on of this domain (cal-if/exynos9830/flexpmu_cal_local_exynos9830.h, embedded_g3d_on[]):
++	 * PLL_CON1_PLL_G3D = 0x30000003, PLL_CON0_PLL_G3D bit 4 = 1, CMU_G3D +0x600 bit 4 = 1, PMU +0x2220 |= 2, a delay,
++	 * CONFIGURATION = 1, wait STATUS bit 0; its power-off leaves PLL_CON1_PLL_G3D = 0x10000001. Read only here.
++	 */
++	say("mali: PLL_CON1_PLL_G3D %#x (Samsung: 0x30000003 on, 0x10000001 off), EMBEDDED_G3D_OUT %#x (on: bit 1)\n",
++	    rd(cmu_top + 0x104), rd(pmu + 0x220));
++	{
++		/* Samsung's exynos_acpm_get_rate(): channel 5 (acpm_dvfs), cmd {domain, 0, FREQ_GET = 1, 0}, the answer in
++		 * cmd[1] in kHz; the GPU is domain 10 (g3d_cmu_cal_id 0xb04000a & 0xffff). A question: nothing is set. */
++		uint32_t q[4] = { ACPM_DVFS_G3D, 0, ACPM_FREQ_GET, 0 };
++		int r = hakios_exynos_acpm(ACPM_CH_DVFS, q);
++
++		say("mali: the APM says the GPU's clock is %u kHz (answer %d: %#x %#x %#x %#x)\n", r == 0 ? q[1] : 0, r,
++		    q[0], q[1], q[2], q[3]);
++		hakios_exynos_acpm_show(ACPM_CH_DVFS);          /* (read only: why it does or does not answer) */
++		hakios_exynos_acpm_show(9);                     /* the TMU's, which answers, to compare */
++		hakios_exynos_acpm_list();                      /* by place: Samsung's acpm_ipc.c sends to channel[5] by place */
++	}
++	/* (CMU_G3D +0x83c, which the device tree names, is not to be read from here: run 33, a synchronous external abort) */
++	if (!(status & 1)) {
++		say("mali: the GPU's power domain is off: its registers are not read, and the steps end here (step G2 is "
++		    "switching it on)\n");
++		return false;
++	}
++	id = G(GPU_ID);
++	shader_present = (uint64_t)G(SHADER_PRESENT_HI) << 32 | G(SHADER_PRESENT_LO);
++	tiler_present = G(TILER_PRESENT_LO);
++	l2_present = G(L2_PRESENT_LO);
++	js_present = G(JS_PRESENT);
++	as_present = G(AS_PRESENT);
++	pa_bits = (G(MMU_FEATURES) >> 8) & 0xff;
++	say("mali: GPU_ID %#x (product %#x, r%up%u), GPU_STATUS %#x\n", id, id >> 16, (id >> 12) & 0xf, (id >> 4) & 0xff,
++	    G(GPU_STATUS));
++	say("mali: L2_FEATURES %#x CORE_FEATURES %#x TILER_FEATURES %#x MEM_FEATURES %#x MMU_FEATURES %#x\n",
++	    G(L2_FEATURES), G(CORE_FEATURES), G(TILER_FEATURES), G(MEM_FEATURES), G(MMU_FEATURES));
++	say("mali: present: shaders %#llx, tiler %#x, L2 %#x, address spaces %#x, job slots %#x\n", shader_present,
++	    tiler_present, l2_present, as_present, js_present);
++	say("mali: ready: shaders %#x, tiler %#x, L2 %#x; coherency features %#x enable %#x\n", G(SHADER_READY_LO),
++	    G(TILER_READY_LO), G(L2_READY_LO), G(COHERENCY_FEATURES), G(COHERENCY_ENABLE));
++	say("mali: interrupts raw: GPU %#x job %#x MMU %#x; masks: GPU %#x job %#x MMU %#x; fault %#x at %#x\n",
++	    G(GPU_IRQ_RAWSTAT), G(JOB_IRQ_RAWSTAT), G(MMU_IRQ_RAWSTAT), G(GPU_IRQ_MASK), G(JOB_IRQ_MASK),
++	    G(MMU_IRQ_MASK), G(GPU_FAULTSTATUS), G(GPU_FAULTADDRESS_LO));
++	if ((id >> 16) != 0x9080) {
++		say("mali: not the Mali-G77 this was written for: the steps end here\n");
++		return false;
++	}
++	if (shader_present == 0 || l2_present == 0 || !(js_present & 1u << JOB_SLOT) || !(as_present & 1) || pa_bits < 32) {
++		say("mali: something the steps need is missing: they end here\n");
++		return false;
++	}
++	return true;
++}
++
++/* ---- step 2: soft reset -------------------------------------------------------------------------- */
++
++static void
++masks_off(void)
++{
++	P(GPU_IRQ_MASK, 0);
++	P(JOB_IRQ_MASK, 0);
++	P(MMU_IRQ_MASK, 0);
++}
++
++/*
++ * Do our writes reach the GPU? Runs 32-34: clearing the interrupt status did nothing and no power-on was ever seen,
++ * while every read answered. AS 0's table address is a plain register that does nothing until AS_COMMAND_UPDATE: a
++ * number written there is read back, then 0 again.
++ */
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++extern unsigned long long ml_phys_read_double_64(addr64_t paddr);
++
++/*
++ * How the kernel maps an address: the stage-1 descriptors of a kernel VA, walked by hand from TTBR1_EL1 (13 Nov: the
++ * loader's writes to the GPU stick before and after a kernel run, the kernel's never do, its reads are right).
++ */
++static void
++show_mapping(const char *what, vm_offset_t va)
++{
++	uint64_t tcr, ttbr1, mair, table, desc = 0;
++	unsigned tg1, granule_shift, bits, t1sz, level, index_bits;
++
++	__asm__ volatile ("mrs %0, tcr_el1" : "=r" (tcr));
++	__asm__ volatile ("mrs %0, ttbr1_el1" : "=r" (ttbr1));
++	__asm__ volatile ("mrs %0, mair_el1" : "=r" (mair));
++	tg1 = (unsigned)(tcr >> 30) & 3;                /* 1: 16K, 2: 4K, 3: 64K */
++	granule_shift = tg1 == 1 ? 14 : tg1 == 3 ? 16 : 12;
++	t1sz = (unsigned)(tcr >> 16) & 0x3f;
++	bits = 64 - t1sz;
++	index_bits = granule_shift - 3;
++	level = (unsigned)(4 - (bits - granule_shift + index_bits - 1) / index_bits);
++	table = ttbr1 & 0x0000fffffffffffeull;
++	say("mali: %s: VA %#lx; TCR %#llx (granule %u K, %u bits), MAIR %#llx\n", what, (unsigned long)va, tcr,
++	    1u << (granule_shift - 10), bits, mair);
++	for (unsigned first = level; level <= 3; level++) {
++		unsigned shift = granule_shift + (3 - level) * index_bits;
++		unsigned width = level == first ? bits - shift : index_bits;   /* the top level indexes what is left */
++		uint64_t idx = (va >> shift) & ((1ull << width) - 1);
++
++		desc = ml_phys_read_double_64(table + idx * 8);
++		say("mali:   level %u entry %llu: %#llx\n", level, idx, desc);
++		if ((desc & 3) != 3 || level == 3) {
++			break;                          /* a block, the page, or nothing */
++		}
++		table = desc & 0x0000fffffffff000ull & ~((1ull << granule_shift) - 1);
++	}
++	say("mali:   -> AttrIndx %llu (MAIR byte %#llx), AP %llu (2,3: read only), output %#llx\n", (desc >> 2) & 7,
++	    (mair >> (8 * ((desc >> 2) & 7))) & 0xff, (desc >> 6) & 3, desc & 0x0000fffffffff000ull);
++}
++
++/* the write test through another mapping of the GPU's registers: normal memory, uncached (posted, combined) */
++static void
++__unused writes_land_other(void)
++{
++	vm_offset_t m = ml_io_map_wcomb(MALI_PA, 0x4000);
++	uint32_t seen, after;
++
++	if (m == 0) {
++		return;
++	}
++	show_mapping("the GPU, uncached-normal mapping", m);
++	wr(m + AS(0) + AS_TRANSTAB_LO, 0x5a5a5000u);
++	seen = rd(m + AS(0) + AS_TRANSTAB_LO);
++	wr(m + AS(0) + AS_TRANSTAB_LO, 0);
++	after = rd(m + AS(0) + AS_TRANSTAB_LO);
++	say("mali: write test through the uncached-normal mapping: read %#x, then %#x: %s\n", seen, after,
++	    seen == 0x5a5a5000u && after == 0 ? "WRITES REACH THE GPU THIS WAY" : "not this way either");
++}
++
++static bool
++writes_land(void)
++{
++	uint32_t seen, after;
++
++	P(AS(0) + AS_TRANSTAB_LO, 0x5a5a5000u);
++	seen = G(AS(0) + AS_TRANSTAB_LO);
++	P(AS(0) + AS_TRANSTAB_LO, 0);
++	after = G(AS(0) + AS_TRANSTAB_LO);
++	say("mali: write test: AS 0 table address written 0x5a5a5000, read %#x; written 0, read %#x: %s\n", seen, after,
++	    seen == 0x5a5a5000u && after == 0 ? "OUR WRITES REACH THE GPU" : "our writes do NOT reach the GPU");
++	return seen == 0x5a5a5000u && after == 0;
++}
++
++/*
++ * Samsung's power-domain code (cal-if/pmucal_local.c, pmucal_local_enable()) switches the G3D domain on and then, for a
++ * domain whose device tree says need_smc (pd-embedded_g3d: 0x18410204), asks the secure firmware to restore the
++ * block's protection settings (its TZPC): exynos_pd_tz_restore() = exynos_smc(SMC_CMD_PREAPRE_PD_ONOFF 0x82000410,
++ * EXYNOS_WAKEUP_PD_DOWN 1, 0x18410204, RUNTIME_PM_TZPC_GROUP 2) (exynos-el3_mon.c, include/linux/smc.h). Until then the
++ * block's registers may be the secure world's to write. Only with mali_tz=1 (the owner's OK, 12 Nov).
++ */
++static uint64_t
++smc4(uint64_t function, uint64_t a1, uint64_t a2, uint64_t a3)
++{
++	register uint64_t x0 __asm__("x0") = function;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = a3;
++
++	__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	return x0;
++}
++
++#define SMC_CMD_PREAPRE_PD_ONOFF        0x82000410u
++#define EXYNOS_WAKEUP_PD_DOWN           1u
++#define G3D_NEED_SMC                    0x18410204u
++#define RUNTIME_PM_TZPC_GROUP           2u
++
++static void
++tz_restore(void)
++{
++	uint64_t ret;
++
++	say("mali: asking the secure firmware to restore the G3D block's protection (as Samsung's kernel does after the "
++	    "domain comes on)\n");
++	ret = smc4(SMC_CMD_PREAPRE_PD_ONOFF, EXYNOS_WAKEUP_PD_DOWN, G3D_NEED_SMC, RUNTIME_PM_TZPC_GROUP);
++	say("mali: secure firmware answered %#llx (0: done)\n", ret);
++}
++
++static bool
++soft_reset(void)
++{
++	masks_off();
++	P(GPU_IRQ_CLEAR, 0xffffffffu);
++	say("mali: before the reset: GPU raw %#x after clearing it (0: our writes reach the GPU), latest flush %#x\n",
++	    G(GPU_IRQ_RAWSTAT), G(LATEST_FLUSH));
++	if (G(GPU_IRQ_RAWSTAT) & GPU_IRQ_RESET_COMPLETED) {
++		say("mali: the old \"reset completed\" did not clear: no reset can be seen\n");
++		return false;
++	}
++	P(GPU_COMMAND, GPU_CMD_SOFT_RESET);
++	if (!wait_for(GPU_IRQ_RAWSTAT, GPU_IRQ_RESET_COMPLETED, GPU_IRQ_RESET_COMPLETED, 100)) {
++		say("mali: no RESET_COMPLETED within 100 ms (raw %#x, status %#x)\n", G(GPU_IRQ_RAWSTAT), G(GPU_STATUS));
++		return false;
++	}
++	P(GPU_IRQ_CLEAR, 0xffffffffu);
++	masks_off();
++	P(JOB_IRQ_CLEAR, 0xffffffffu);
++	P(MMU_IRQ_CLEAR, 0xffffffffu);
++	return true;
++}
++
++/*
++ * The GPU's clock, as Samsung's power-on of the domain starts it (embedded_g3d_on[], flexpmu_cal_local_exynos9830.h)
++ * before it switches the domain on. Run 41: S-BOOT leaves the domain on but PLL_CON1_PLL_G3D at 0x10000001 (what
++ * Samsung's power-off leaves) and EMBEDDED_G3D_OUT without bit 1: the GPU's registers answer reads, take no write.
++ * Only with mali_clk=1 (the owner's OK). The PLL's own frequency (PLL_CON3: 260 MHz) is not touched.
++ */
++#define PLL_CON1_PLL_G3D        0x104u
++#define PLL_G3D_RUN             0x30000003u
++#define PLL_G3D_STOPPED         0x10000001u
++#define PLL_G3D_LOCKED          (1u << 29)      /* of PLL_CON3 */
++#define CMU_G3D_PA              0x18400000u
++#define MUX_CLKCMU_G3D_USER     0x600u          /* bit 4: the CMU_TOP clock (1), not the crystal (0) */
++#define PMU_EMBEDDED_G3D_OUT    0x220u          /* bit 1 */
++
++static uint32_t clk_saved_con1, clk_saved_out, clk_saved_mux;
++static bool clk_started, mux_set;
++static vm_offset_t cmu_g3d;
++
++static void
++clock_start(void)
++{
++	uint32_t con3 = 0;
++
++	clk_saved_con1 = rd(cmu_top + PLL_CON1_PLL_G3D);
++	clk_saved_out = rd(pmu + PMU_EMBEDDED_G3D_OUT);
++	say("mali: starting the GPU's clock as Samsung does: PLL_CON1 %#x -> %#x, EMBEDDED_G3D_OUT %#x -> %#x\n",
++	    clk_saved_con1, PLL_G3D_RUN, clk_saved_out, clk_saved_out | 2);
++	clk_started = true;
++	wr(cmu_top + PLL_CON1_PLL_G3D, PLL_G3D_RUN);
++	if (!(rd(cmu_top + PLL_CON0_PLL_G3D) & 0x10)) {
++		wr(cmu_top + PLL_CON0_PLL_G3D, rd(cmu_top + PLL_CON0_PLL_G3D) | 0x10);
++	}
++	for (uint32_t us = 0; us < 10000; us += 10) {
++		con3 = rd(cmu_top + PLL_CON3_PLL_G3D);
++		if (con3 & PLL_G3D_LOCKED) {
++			break;
++		}
++		delay_for_interval(10, NSEC_PER_USEC);
++	}
++	say("mali: PLL_G3D: con1 %#x con3 %#x: %s\n", rd(cmu_top + PLL_CON1_PLL_G3D), con3,
++	    (con3 & PLL_G3D_LOCKED) ? "LOCKED" : "still not locked");
++	if (!(con3 & PLL_G3D_LOCKED)) {
++		return;
++	}
++	cmu_g3d = low_map(CMU_G3D_PA, 1);
++	if (cmu_g3d != 0) {
++		clk_saved_mux = rd(cmu_g3d + MUX_CLKCMU_G3D_USER);     /* (run 33: CMU_G3D could not be read; with the PLL on?) */
++		say("mali: CMU_G3D user mux %#x\n", clk_saved_mux);
++		if (!(clk_saved_mux & 0x10)) {
++			wr(cmu_g3d + MUX_CLKCMU_G3D_USER, clk_saved_mux | 0x10);
++			mux_set = true;
++			say("mali: CMU_G3D user mux now %#x\n", rd(cmu_g3d + MUX_CLKCMU_G3D_USER));
++		}
++	}
++	wr(pmu + PMU_EMBEDDED_G3D_OUT, clk_saved_out | 2);
++	delay_for_interval(20, NSEC_PER_USEC);
++	say("mali: EMBEDDED_G3D_OUT now %#x\n", rd(pmu + PMU_EMBEDDED_G3D_OUT));
++}
++
++/* everything clock_start() changed, back as it was, in Samsung's power-off order */
++static void
++clock_stop(void)
++{
++	if (!clk_started) {
++		return;
++	}
++	wr(pmu + PMU_EMBEDDED_G3D_OUT, clk_saved_out);
++	if (mux_set) {
++		wr(cmu_g3d + MUX_CLKCMU_G3D_USER, clk_saved_mux);
++	}
++	wr(cmu_top + PLL_CON1_PLL_G3D, clk_saved_con1);
++	clk_started = mux_set = false;
++	say("mali: the GPU's clock as it was: PLL_CON1 %#x, EMBEDDED_G3D_OUT %#x\n", rd(cmu_top + PLL_CON1_PLL_G3D),
++	    rd(pmu + PMU_EMBEDDED_G3D_OUT));
++}
++
++/*
++ * The G3D domain switched off and on again exactly as Samsung's kernel does it (cal-if/pmucal_local.c with
++ * exynos9830/flexpmu_cal_local_exynos9830.h embedded_g3d_off[] / embedded_g3d_on[], and exynos-el3_mon.c's TZPC save
++ * and restore). TWRP's Linux, 12 Nov: after such a cycle its Mali driver writes SHADER_PWRON and the cores come on;
++ * S-BOOT only ever leaves the domain on with the GPU's PLL stopped, and nothing of ours reached the GPU in that state
++ * (runs 32-43, with the PLL started and the TZPC restored by themselves too). Only with mali_cycle=1 (owner's OK).
++ *   off: TZPC save (SMC 0x82000410, 0, 0x18410204, 2); CONFIGURATION bit 0 = 0, wait STATUS bit 0 = 0; CMU_G3D +0x600
++ *        bit 4 = 0; PLL_CON0_PLL_G3D bit 4 = 0; PLL_CON1_PLL_G3D = 0x10000001
++ *   on:  PLL_CON1_PLL_G3D = 0x30000003; PLL_CON0_PLL_G3D bit 4 = 1; CMU_G3D +0x600 bit 4 = 1; EMBEDDED_G3D_OUT: bit 2
++ *        set through the PMU's atomic "set" alias (+0xc000, written with the bit's number, as exynos-pmu.c does);
++ *        280 us; CONFIGURATION bit 0 = 1, wait STATUS bit 0 = 1; TZPC restore (SMC 0x82000410, 1, 0x18410204, 2)
++ */
++#define EXYNOS_GET_IN_PD_DOWN           0u
++#define PMU_SET_ALIAS_PA                0x1586e000u     /* 0x15860000 + (0x2220 | 0xc000), its page */
++
++static vm_offset_t pmu_set;
++static bool cycled;
++
++static bool
++wait_status(uint32_t want, uint32_t ms)
++{
++	for (uint32_t us = 0; us <= ms * 1000; us += 10) {
++		if ((rd(pmu + PMU_G3D_STATUS) & 1) == want) {
++			return true;
++		}
++		delay_for_interval(10, NSEC_PER_USEC);
++	}
++	return false;
++}
++
++static void
++domain_off(void)
++{
++	uint64_t r = smc4(SMC_CMD_PREAPRE_PD_ONOFF, EXYNOS_GET_IN_PD_DOWN, G3D_NEED_SMC, RUNTIME_PM_TZPC_GROUP);
++	bool off;
++
++	say("mali: G3D off as Samsung does it: TZPC save answered %#llx\n", r);
++	wr(pmu + PMU_G3D_CONFIGURATION, rd(pmu + PMU_G3D_CONFIGURATION) & ~1u);
++	off = wait_status(0, 10);
++	if (cmu_g3d != 0) {
++		wr(cmu_g3d + MUX_CLKCMU_G3D_USER, rd(cmu_g3d + MUX_CLKCMU_G3D_USER) & ~0x10u);
++	}
++	wr(cmu_top + PLL_CON0_PLL_G3D, rd(cmu_top + PLL_CON0_PLL_G3D) & ~0x10u);
++	wr(cmu_top + PLL_CON1_PLL_G3D, PLL_G3D_STOPPED);
++	say("mali: G3D %s: status %#x, PLL con0 %#x con3 %#x\n", off ? "OFF" : "did not go off", rd(pmu + PMU_G3D_STATUS),
++	    rd(cmu_top + PLL_CON0_PLL_G3D), rd(cmu_top + PLL_CON3_PLL_G3D));
++}
++
++static bool
++domain_on(void)
++{
++	uint64_t r;
++	uint32_t con3 = 0;
++	bool on;
++
++	wr(cmu_top + PLL_CON1_PLL_G3D, PLL_G3D_RUN);
++	wr(cmu_top + PLL_CON0_PLL_G3D, rd(cmu_top + PLL_CON0_PLL_G3D) | 0x10u);
++	for (uint32_t us = 0; us < 10000 && !(con3 & PLL_G3D_LOCKED); us += 10) {
++		con3 = rd(cmu_top + PLL_CON3_PLL_G3D);
++		delay_for_interval(10, NSEC_PER_USEC);
++	}
++	if (cmu_g3d != 0) {
++		wr(cmu_g3d + MUX_CLKCMU_G3D_USER, rd(cmu_g3d + MUX_CLKCMU_G3D_USER) | 0x10u);
++	}
++	wr(pmu_set + (PMU_EMBEDDED_G3D_OUT & 0xfffu), 2);       /* bit 2 of EMBEDDED_G3D_OUT, atomically */
++	delay_for_interval(280, NSEC_PER_USEC);
++	wr(pmu + PMU_G3D_CONFIGURATION, rd(pmu + PMU_G3D_CONFIGURATION) | 1u);
++	on = wait_status(1, 10);
++	r = smc4(SMC_CMD_PREAPRE_PD_ONOFF, EXYNOS_WAKEUP_PD_DOWN, G3D_NEED_SMC, RUNTIME_PM_TZPC_GROUP);
++	say("mali: G3D on as Samsung does it: %s (status %#x), PLL con3 %#x (%s), out %#x, TZPC restore answered %#llx\n",
++	    on ? "ON" : "did not come on", rd(pmu + PMU_G3D_STATUS), con3, (con3 & PLL_G3D_LOCKED) ? "locked" : "not locked",
++	    rd(pmu + PMU_EMBEDDED_G3D_OUT), r);
++	return on;
++}
++
++static bool
++domain_cycle(void)
++{
++	pmu_set = low_map(PMU_SET_ALIAS_PA, 1);
++	if (cmu_g3d == 0) {
++		cmu_g3d = low_map(CMU_G3D_PA, 1);
++	}
++	if (pmu_set == 0 || cmu_g3d == 0) {
++		say("mali: could not map the PMU's set alias or CMU_G3D\n");
++		return false;
++	}
++	cycled = true;
++	domain_off();
++	delay_for_interval(1, NSEC_PER_MSEC);
++	return domain_on();
++}
++
++static bool
++step_reset(void)
++{
++	uint32_t tz = 0, clk = 0, cycle = 0;
++
++	if (!writes_land() && PE_parse_boot_argn("mali_cycle", &cycle, sizeof(cycle)) && cycle) {
++		if (!domain_cycle()) {
++			return false;
++		}
++	}
++	if (!writes_land()) {
++		if (PE_parse_boot_argn("mali_clk", &clk, sizeof(clk)) && clk) {
++			clock_start();
++		}
++		if (!writes_land()) {
++			if (!(PE_parse_boot_argn("mali_tz", &tz, sizeof(tz)) && tz)) {
++				return false;
++			}
++			tz_restore();
++			if (!writes_land()) {
++				return false;
++			}
++		}
++	}
++	if (!soft_reset()) {
++		return false;
++	}
++	say("mali: reset done; ready: shaders %#x tiler %#x L2 %#x, GPU_STATUS %#x, latest flush %#x\n",
++	    G(SHADER_READY_LO), G(TILER_READY_LO), G(L2_READY_LO), G(GPU_STATUS), G(LATEST_FLUSH));
++	return true;
++}
++
++/* ---- step 3: power ------------------------------------------------------------------------------- */
++
++static void
++power_off(void)
++{
++	uint32_t sl = G(SHADER_READY_LO), sh = G(SHADER_READY_HI), t = G(TILER_READY_LO), l2 = G(L2_READY_LO);
++
++	if (sl | sh) {
++		P(SHADER_PWROFF_LO, sl);
++		if (sh) {
++			P(SHADER_PWROFF_HI, sh);
++		}
++		wait_for(SHADER_READY_LO, 0xffffffffu, 0, 100);
++	}
++	if (t) {
++		P(TILER_PWROFF_LO, t);
++		wait_for(TILER_READY_LO, 0xffffffffu, 0, 100);
++	}
++	if (l2) {
++		P(L2_PWROFF_LO, l2);
++		wait_for(L2_READY_LO, 0xffffffffu, 0, 100);
++	}
++	powered = false;
++	say("mali: powered off: ready now shaders %#x tiler %#x L2 %#x (in transition %#x %#x %#x)\n", G(SHADER_READY_LO),
++	    G(TILER_READY_LO), G(L2_READY_LO), G(SHADER_PWRTRANS_LO), G(TILER_PWRTRANS_LO), G(L2_PWRTRANS_LO));
++}
++
++static bool
++step_power(void)
++{
++	if (!cool_enough("(step 3)")) {
++		return false;
++	}
++	powered = true;
++	P(L2_PWRON_LO, l2_present);
++	for (uint32_t i = 0; i < 4; i++) {
++		say("mali: %u us after L2 on: ready %#x, in transition %#x, GPU raw %#x, GPU_STATUS %#x, fault %#x\n",
++		    i * 20, G(L2_READY_LO), G(L2_PWRTRANS_LO), G(GPU_IRQ_RAWSTAT), G(GPU_STATUS), G(GPU_FAULTSTATUS));
++		delay_for_interval(20, NSEC_PER_USEC);
++	}
++	if (!wait_for(L2_READY_LO, l2_present, l2_present, 100)) {
++		say("mali: the L2 did not come on (ready %#x, in transition %#x)\n", G(L2_READY_LO), G(L2_PWRTRANS_LO));
++		return false;
++	}
++	if (tiler_present) {
++		P(TILER_PWRON_LO, tiler_present);
++		if (!wait_for(TILER_READY_LO, tiler_present, tiler_present, 100)) {
++			say("mali: the tiler did not come on (ready %#x)\n", G(TILER_READY_LO));
++			return false;
++		}
++	}
++	P(SHADER_PWRON_LO, (uint32_t)shader_present);
++	if (shader_present >> 32) {
++		P(SHADER_PWRON_HI, (uint32_t)(shader_present >> 32));
++	}
++	if (!wait_for(SHADER_READY_LO, (uint32_t)shader_present, (uint32_t)shader_present, 100)) {
++		say("mali: the shader cores did not all come on (ready %#x, in transition %#x)\n", G(SHADER_READY_LO),
++		    G(SHADER_PWRTRANS_LO));
++		return false;
++	}
++	say("mali: on: L2 %#x, tiler %#x, shaders %#x; GPU_STATUS %#x\n", G(L2_READY_LO), G(TILER_READY_LO),
++	    G(SHADER_READY_LO), G(GPU_STATUS));
++	return cool_enough("(after power on)");
++}
++
++/* ---- step 4: an address space -------------------------------------------------------------------- */
++
++static vm_offset_t tables, page;        /* 16K each: the four 4K tables; the page the GPU sees at GPU_VA */
++static uint64_t tables_phys, page_phys;
++
++/* 16K of wired memory, zero, that is in one piece in physical memory too */
++static bool
++contiguous(vm_offset_t *va, uint64_t *phys)
++{
++	if (kmem_alloc(kernel_map, va, 16384, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return false;
++	}
++	*phys = kvtophys(*va);
++	for (uint32_t off = 4096; off < 16384; off += 4096) {
++		if (kvtophys(*va + off) != *phys + off) {
++			return false;
++		}
++	}
++	return *phys != 0 && (*phys & 4095) == 0 && (pa_bits >= 64 || (*phys + 16384) <= (1ull << pa_bits));
++}
++
++static bool
++step_space(void)
++{
++	uint64_t *l0, *l1, *l2, *l3;
++
++	if (!contiguous(&tables, &tables_phys) || !contiguous(&page, &page_phys)) {
++		say("mali: no memory in one piece for the tables or the page\n");
++		return false;
++	}
++	l0 = (uint64_t *)tables;
++	l1 = (uint64_t *)(tables + 4096);
++	l2 = (uint64_t *)(tables + 8192);
++	l3 = (uint64_t *)(tables + 12288);
++	l0[(GPU_VA >> 39) & 511] = ((tables_phys + 4096) & PTE_ADDRESS) | PTE_TABLE;
++	l1[(GPU_VA >> 30) & 511] = ((tables_phys + 8192) & PTE_ADDRESS) | PTE_TABLE;
++	l2[(GPU_VA >> 21) & 511] = ((tables_phys + 12288) & PTE_ADDRESS) | PTE_TABLE;
++	for (uint32_t i = 0; i < 4; i++) {
++		l3[((GPU_VA >> 12) & 511) + i] = ((page_phys + 4096 * i) & PTE_ADDRESS) | PTE_ACCESS_FLAG | PTE_ACCESS_RW |
++		    PTE_NX | PTE_PAGE;          /* memory kind 0: non-cacheable */
++	}
++	to_memory(tables, 16384);
++	to_memory(page, 16384);
++
++	P(AS(0) + AS_TRANSCFG_LO, AS_TRANSCFG_ADRMODE_AARCH64_4K | AS_TRANSCFG_PTW_NON_CACHEABLE);
++	P(AS(0) + AS_TRANSCFG_HI, 0);
++	P(AS(0) + AS_TRANSTAB_LO, (uint32_t)tables_phys);
++	P(AS(0) + AS_TRANSTAB_HI, (uint32_t)(tables_phys >> 32));
++	P(AS(0) + AS_MEMATTR_LO, AS_MEMATTR_NON_CACHEABLE);
++	P(AS(0) + AS_MEMATTR_HI, AS_MEMATTR_NON_CACHEABLE);
++	P(AS(0) + AS_COMMAND, AS_COMMAND_UPDATE);
++	if (!wait_for(AS(0) + AS_STATUS, 1, 0, 100)) {
++		say("mali: AS 0 still busy after its update (status %#x)\n", G(AS(0) + AS_STATUS));
++		return false;
++	}
++	P(MMU_IRQ_CLEAR, 0xffffffffu);
++	say("mali: AS 0: tables at %#llx, GPU %#llx-%#llx -> %#llx; transcfg %#x memattr %#x status %#x\n", tables_phys,
++	    GPU_VA, GPU_VA + 16383, page_phys, G(AS(0) + AS_TRANSCFG_LO), G(AS(0) + AS_MEMATTR_LO), G(AS(0) + AS_STATUS));
++	return true;
++}
++
++/* ---- step 5: a job ------------------------------------------------------------------------------- */
++
++#define JOB_TYPE_WRITE_VALUE    2
++#define WRITE_VALUE_IMM32       6
++#define TARGET_OFFSET           0x1000          /* in the page: where the job writes, a 4K page after the job */
++#define MAGIC                   0x6a0b77u       /* what it writes */
++
++static bool
++step_job(void)
++{
++	volatile uint32_t *job = (volatile uint32_t *)page;
++	volatile uint32_t *target = (volatile uint32_t *)(page + TARGET_OFFSET);
++	uint32_t raw, js_status, cfg;
++	uint64_t start, end, ns;
++	bool done;
++
++	/* the job header (64-byte aligned) and the write-value payload after it, at +0x20 */
++	job[0] = 0;                                     /* exception status: the GPU writes 1 here when it is done */
++	job[1] = 0;                                     /* first incomplete task */
++	job[2] = job[3] = 0;                            /* fault pointer */
++	job[4] = 1u | JOB_TYPE_WRITE_VALUE << 1 | 1u << 16;     /* 64-bit descriptors, the type, index 1 */
++	job[5] = 0;                                     /* no dependencies */
++	job[6] = job[7] = 0;                            /* no next job */
++	job[8] = (uint32_t)(GPU_VA + TARGET_OFFSET);    /* the address written */
++	job[9] = (uint32_t)((GPU_VA + TARGET_OFFSET) >> 32);
++	job[10] = WRITE_VALUE_IMM32;
++	job[11] = 0;
++	job[12] = MAGIC;                                /* the value */
++	job[13] = 0;
++	*target = 0xdeadbeefu;
++	to_memory(page, 16384);
++
++	if (G(JS(JOB_SLOT) + JS_COMMAND_NEXT) != 0) {
++		say("mali: job slot %u is not free (command next %#x)\n", JOB_SLOT, G(JS(JOB_SLOT) + JS_COMMAND_NEXT));
++		return false;
++	}
++	if (!cool_enough("(step 5)")) {
++		return false;
++	}
++	P(JOB_IRQ_CLEAR, 0xffffffffu);
++	P(MMU_IRQ_CLEAR, 0xffffffffu);
++	cfg = 0 /* AS 0 */ | JS_CONFIG_START_FLUSH_CLEAN_INVALIDATE | JS_CONFIG_END_FLUSH_CLEAN_INVALIDATE |
++	    JS_CONFIG_THREAD_PRI(8);
++	P(JS(JOB_SLOT) + JS_HEAD_NEXT_LO, (uint32_t)GPU_VA);
++	P(JS(JOB_SLOT) + JS_HEAD_NEXT_HI, (uint32_t)(GPU_VA >> 32));
++	P(JS(JOB_SLOT) + JS_AFFINITY_NEXT_LO, (uint32_t)shader_present);
++	P(JS(JOB_SLOT) + JS_AFFINITY_NEXT_HI, (uint32_t)(shader_present >> 32));
++	P(JS(JOB_SLOT) + JS_CONFIG_NEXT, cfg);
++	start = mach_absolute_time();
++	P(JS(JOB_SLOT) + JS_COMMAND_NEXT, JS_COMMAND_START);
++
++	done = false;
++	for (uint32_t us = 0; us <= 100000 && !done; us += 10) {
++		raw = G(JOB_IRQ_RAWSTAT);
++		done = (raw & (1u << JOB_SLOT | 1u << (16 + JOB_SLOT))) != 0;
++		if (!done) {
++			delay_for_interval(10, NSEC_PER_USEC);
++		}
++	}
++	end = mach_absolute_time();
++	absolutetime_to_nanoseconds(end - start, &ns);
++	raw = G(JOB_IRQ_RAWSTAT);
++	js_status = G(JS(JOB_SLOT) + JS_STATUS);
++	say("mali: job: interrupts raw %#x, slot %u status %#x, head %#x, after %llu us; MMU raw %#x, AS 0 fault %#x at "
++	    "%#x%08x; GPU raw %#x fault %#x\n", raw, JOB_SLOT, js_status, G(JS(JOB_SLOT) + JS_HEAD_LO), ns / 1000,
++	    G(MMU_IRQ_RAWSTAT), G(AS(0) + AS_FAULTSTATUS), G(AS(0) + AS_FAULTADDRESS_HI), G(AS(0) + AS_FAULTADDRESS_LO),
++	    G(GPU_IRQ_RAWSTAT), G(GPU_FAULTSTATUS));
++	if (!done) {
++		say("mali: the job did not finish within 100 ms: hard stop\n");
++		P(JS(JOB_SLOT) + JS_COMMAND, JS_COMMAND_HARD_STOP);
++		delay_for_interval(10, NSEC_PER_MSEC);
++		say("mali: after the stop: interrupts raw %#x, slot status %#x\n", G(JOB_IRQ_RAWSTAT),
++		    G(JS(JOB_SLOT) + JS_STATUS));
++	}
++	P(JOB_IRQ_CLEAR, 0xffffffffu);
++	to_memory(page, 16384);                 /* forget what this processor remembers: read what the GPU wrote */
++	say("mali: memory: the job's status word %#x, the value at GPU %#llx: %#x (%s)\n", job[0],
++	    GPU_VA + TARGET_OFFSET, *target, *target == MAGIC ? "WRITTEN BY THE GPU" : "not written");
++	return done && (raw & 1u << JOB_SLOT) && *target == MAGIC;
++}
++
++/* ---- the GPU kept for the system: HakiosGPU's backend (mali_keep=1, Panfrost's interface) --------- */
++
++/*
++ * drivers/gpu/hakios.gpu.cpp serves Panfrost's requests (tools/mesa/hakios-drm, Mesa's panfrost) with these. GPU
++ * addresses 0x10000000-0x4fffffff (1 GB) in address space 0, 4K pages, four levels (the level-3 tables made as
++ * needed); every buffer non-cacheable for the GPU (MEMATTR 0x4c: the CPU maps them write-combined) and executable
++ * (shaders run from them). Jobs one at a time: a submission waits for the one before to finish; no interrupts yet,
++ * the job slots' state is asked for. Each register access through the low window (rd()/wr() above).
++ */
++bool hakios_mali_gpu_ready(void);
++bool hakios_mali_gpu_parameter(uint32_t which, uint64_t *value);
++uint64_t hakios_mali_gpu_address(uint64_t size);
++void hakios_mali_gpu_address_free(uint64_t address, uint64_t size);
++bool hakios_mali_gpu_map(uint64_t address, uint64_t phys, bool read_only);
++void hakios_mali_gpu_mapped(void);
++void hakios_mali_gpu_unmap(uint64_t address, uint64_t size);
++void hakios_mali_gpu_to_memory(void *start, uint64_t size);
++uint32_t hakios_mali_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
++bool hakios_mali_gpu_done(uint32_t fence);
++uint32_t hakios_mali_gpu_last(void);
++void hakios_mali_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
++void hakios_mali_gpu_report(const char *why);
++void hakios_mali_gpu_stop(void);
++
++#define KEEP_VA_BASE            0x10000000ull
++#define KEEP_VA_PAGES           (1u << 18)              /* 1 GB of 4K pages */
++#define KEEP_L3_TABLES          (KEEP_VA_PAGES / 512)
++#define KEEP_ASK_US             50                      /* how often a submission looks at whether the job before is done */
++#define KEEP_SUBMIT_MS          2000                    /* the most a submission waits for the job before it */
++
++static bool kept;
++static uint64_t *k_l0, *k_l1, *k_l2[2];
++static uint64_t k_l0_pa;
++static uint64_t *k_l3[KEEP_L3_TABLES];
++static uint8_t *k_used;                                 /* a bit per GPU page of the range: given out */
++static uint32_t k_fence, k_done, k_busy_fence;          /* the last fence given, the last seen done, the one running */
++static int k_busy_slot = -1;
++/* the jobs given and not yet started, in order (hakios_mali_gpu_submit), and the lock over them and the GPU's job slots */
++#define K_QUEUE                 64
++struct k_job {
++	uint64_t jc;
++	uint32_t fence;
++	int slot;
++};
++static struct k_job k_queue[K_QUEUE];
++static uint32_t k_queue_first, k_queued;
++static bool k_queue_started;
++static LCK_GRP_DECLARE(k_group, "hakios_mali");
++static LCK_MTX_DECLARE(k_lock, &k_group);
++static void k_start(int slot, uint64_t jc, uint32_t fence);
++static void k_start_next(void);
++static void k_queue_init(void);
++static uint32_t k_jobs, k_faults;
++static uint64_t k_busy_since, k_worked_abs;
++
++static uint64_t *
++k_table(uint64_t *pa)
++{
++	vm_offset_t va = 0;
++
++	if (kmem_alloc(kernel_map, &va, 4096, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return NULL;
++	}
++	*pa = kvtophys(va);
++	to_memory(va, 4096);
++	return (uint64_t *)va;
++}
++
++/* the GPU's MMU told that the tables changed: the whole range locked, its TLB and walk caches flushed (FLUSH_MEM) */
++static void
++k_flush(void)
++{
++	/* LOCKADDR: a naturally aligned power of two, as log2(size) - 1 in bits 5:0 and the base above: 4 GB from 0 */
++	P(AS(0) + 0x10, 31);
++	P(AS(0) + 0x14, 0);
++	P(AS(0) + AS_COMMAND, 0x02);            /* LOCK */
++	wait_for(AS(0) + AS_STATUS, 1, 0, 10);
++	P(AS(0) + AS_COMMAND, 0x05);            /* FLUSH_MEM (and the lock goes) */
++	wait_for(AS(0) + AS_STATUS, 1, 0, 10);
++}
++
++static bool keep_space_again(void);
++
++static bool
++keep_space(void)
++{
++	uint64_t pa1, pa2[2];
++
++	{
++		vm_offset_t bits = 0;
++
++		if (kmem_alloc(kernel_map, &bits, KEEP_VA_PAGES / 8, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) ==
++		    KERN_SUCCESS) {
++			k_used = (uint8_t *)bits;
++		}
++	}
++	k_l0 = k_table(&k_l0_pa);
++	k_l1 = k_table(&pa1);
++	k_l2[0] = k_table(&pa2[0]);
++	k_l2[1] = k_table(&pa2[1]);
++	if (k_used == NULL || k_l0 == NULL || k_l1 == NULL || k_l2[0] == NULL || k_l2[1] == NULL) {
++		return false;
++	}
++	k_l0[0] = (pa1 & PTE_ADDRESS) | PTE_TABLE;
++	k_l1[0] = (pa2[0] & PTE_ADDRESS) | PTE_TABLE;          /* 0x00000000-0x3fffffff */
++	k_l1[1] = (pa2[1] & PTE_ADDRESS) | PTE_TABLE;          /* 0x40000000-0x7fffffff */
++	to_memory((vm_offset_t)k_l0, 4096);
++	to_memory((vm_offset_t)k_l1, 4096);
++	return keep_space_again();
++}
++
++/* address space 0 given its tables (made by keep_space()) and the quirks: at the start and after a reset */
++static bool
++keep_space_again(void)
++{
++	P(AS(0) + AS_TRANSCFG_LO, AS_TRANSCFG_ADRMODE_AARCH64_4K | AS_TRANSCFG_PTW_NON_CACHEABLE);
++	P(AS(0) + AS_TRANSCFG_HI, 0);
++	P(AS(0) + AS_TRANSTAB_LO, (uint32_t)k_l0_pa);
++	P(AS(0) + AS_TRANSTAB_HI, (uint32_t)(k_l0_pa >> 32));
++	P(AS(0) + AS_MEMATTR_LO, AS_MEMATTR_NON_CACHEABLE);
++	P(AS(0) + AS_MEMATTR_HI, AS_MEMATTR_NON_CACHEABLE);
++	P(AS(0) + AS_COMMAND, AS_COMMAND_UPDATE);
++	if (!wait_for(AS(0) + AS_STATUS, 1, 0, 100)) {
++		return false;
++	}
++	/* kbase's quirks for this GPU, as TWRP's Linux had them (13 Nov): JM_CONFIG, SHADER_CONFIG */
++	P(0xf00, 0x000f0000);
++	P(0xf04, 0x20000000);
++	P(JOB_IRQ_CLEAR, 0xffffffffu);
++	P(MMU_IRQ_CLEAR, 0xffffffffu);
++	say("mali: kept: address space 0 at %#llx, GPU addresses %#llx-%#llx\n", k_l0_pa, KEEP_VA_BASE,
++	    KEEP_VA_BASE + 4096ull * KEEP_VA_PAGES - 1);
++	return true;
++}
++
++static void k_recover(void);
++
++/* whether the job running is over (a fault counts: it is reported and its fence given up) */
++static void
++k_poll(void)
++{
++	uint32_t raw;
++
++	if (k_busy_slot < 0) {
++		k_start_next();
++		return;
++	}
++	raw = G(JOB_IRQ_RAWSTAT);
++	if (!(raw & (1u << k_busy_slot | 1u << (16 + k_busy_slot)))) {
++		uint64_t ns;
++
++		absolutetime_to_nanoseconds(mach_absolute_time() - k_busy_since, &ns);
++		if (ns > KEEP_SUBMIT_MS * NSEC_PER_MSEC) {
++			k_recover();            /* (whoever asks first after the job's time is up: a wait, or the next submission) */
++		}
++		return;
++	}
++	if (raw & 1u << (16 + k_busy_slot)) {
++		k_faults++;
++		say("mali: job %u FAILED on slot %d: status %#x, head %#x; MMU raw %#x, AS 0 fault %#x at %#x%08x\n",
++		    k_busy_fence, k_busy_slot, G(JS(k_busy_slot) + JS_STATUS), G(JS(k_busy_slot) + JS_HEAD_LO),
++		    G(MMU_IRQ_RAWSTAT), G(AS(0) + AS_FAULTSTATUS), G(AS(0) + AS_FAULTADDRESS_HI), G(AS(0) + AS_FAULTADDRESS_LO));
++		P(MMU_IRQ_CLEAR, 0xffffffffu);
++	}
++	P(JOB_IRQ_CLEAR, 1u << k_busy_slot | 1u << (16 + k_busy_slot));
++	k_worked_abs += mach_absolute_time() - k_busy_since;
++	k_done = k_busy_fence;
++	k_busy_slot = -1;
++	k_start_next();
++}
++
++/*
++ * A job that does not finish (run 77: CoreAnimation's first job ran on for ever, and every one after it was refused).
++ * What the GPU says about it is reported -- a Mali job that touches an address with no page waits for that page,
++ * it does not fail, and its address space says where -- then the job is stopped hard and the GPU reset, powered and
++ * given its address space again; the job's fence counts as done (its picture is lost, the next ones are not).
++ */
++static void
++k_recover(void)
++{
++	int slot = k_busy_slot;
++
++	say("mali: job %u on slot %d not done after %u ms: status %#x head %#x%08x tail %#x; job raw %#x; MMU raw %#x, AS 0 "
++	    "fault %#x at %#x%08x, AS 0 status %#x; GPU_STATUS %#x fault %#x\n", k_busy_fence, slot, KEEP_SUBMIT_MS,
++	    G(JS(slot) + JS_STATUS), G(JS(slot) + JS_HEAD_HI), G(JS(slot) + JS_HEAD_LO), G(JS(slot) + 0x08),
++	    G(JOB_IRQ_RAWSTAT), G(MMU_IRQ_RAWSTAT), G(AS(0) + AS_FAULTSTATUS), G(AS(0) + AS_FAULTADDRESS_HI),
++	    G(AS(0) + AS_FAULTADDRESS_LO), G(AS(0) + AS_STATUS), G(GPU_STATUS), G(GPU_FAULTSTATUS));
++	P(JS(slot) + JS_COMMAND, JS_COMMAND_HARD_STOP);
++	delay_for_interval(5, NSEC_PER_MSEC);
++	k_faults++;
++	k_done = k_busy_fence;
++	k_busy_slot = -1;
++	/* the reset puts every power domain of the GPU's off and forgets the address space: all of it again */
++	if (!soft_reset() || !step_power() || !keep_space_again()) {
++		say("mali: the GPU did not come back after its reset: it is given up\n");
++		kept = false;
++		return;
++	}
++	say("mali: the GPU reset and running again (%u jobs, %u lost)\n", k_jobs, k_faults);
++}
++
++bool
++hakios_mali_gpu_ready(void)
++{
++	return kept;
++}
++
++bool
++hakios_mali_gpu_parameter(uint32_t which, uint64_t *value)
++{
++	/* Linux's DRM_PANFROST_PARAM_*, in their order */
++	switch (which) {
++	case 0: *value = G(GPU_ID) >> 16; break;                        /* GPU_PROD_ID */
++	case 1: *value = G(GPU_ID) & 0xffff; break;                     /* GPU_REVISION */
++	case 2: *value = (uint64_t)G(SHADER_PRESENT_HI) << 32 | G(SHADER_PRESENT_LO); break;
++	case 3: *value = G(TILER_PRESENT_LO); break;
++	case 4: *value = G(L2_PRESENT_LO); break;
++	case 5: *value = (uint64_t)G(0xe04) << 32 | G(0xe00); break;    /* STACK_PRESENT */
++	case 6: *value = G(AS_PRESENT); break;
++	case 7: *value = G(JS_PRESENT); break;
++	case 8: *value = G(L2_FEATURES); break;
++	case 9: *value = G(CORE_FEATURES); break;
++	case 10: *value = G(TILER_FEATURES); break;
++	case 11: *value = G(MEM_FEATURES); break;
++	case 12: *value = G(MMU_FEATURES); break;
++	case 13: *value = G(0xac); break;                               /* THREAD_FEATURES */
++	case 14: *value = G(0xa0); break;                               /* THREAD_MAX_THREADS */
++	case 15: *value = G(0xa4); break;                               /* THREAD_MAX_WORKGROUP_SIZE */
++	case 16: *value = G(0xa8); break;                               /* THREAD_MAX_BARRIER_SIZE */
++	case 17: *value = G(COHERENCY_FEATURES); break;
++	case 18: case 19: case 20: case 21:
++		*value = G(0xb0 + 4 * (which - 18)); break;                 /* TEXTURE_FEATURES_0..3 */
++	case 22: case 23: case 24: case 25: case 26: case 27: case 28: case 29:
++	case 30: case 31: case 32: case 33: case 34: case 35: case 36: case 37:
++		*value = G(0xc0 + 4 * (which - 22)); break;                 /* JS0..15_FEATURES */
++	case 38: *value = 1; break;                                     /* NR_CORE_GROUPS */
++	case 39: *value = G(0x310); break;                              /* THREAD_TLS_ALLOC */
++	case 40: *value = G(0x4c); break;                               /* AFBC_FEATURES */
++	case 41: *value = mach_absolute_time(); break;                  /* SYSTEM_TIMESTAMP: the 26 MHz counter */
++	case 42: *value = 26000000; break;                              /* SYSTEM_TIMESTAMP_FREQUENCY */
++	default:
++		return false;
++	}
++	return true;
++}
++
++uint64_t
++hakios_mali_gpu_address(uint64_t size)
++{
++	uint32_t pages = (uint32_t)((size + 4095) / 4096), run = 0;
++
++	for (uint32_t i = 0; i < KEEP_VA_PAGES && pages != 0; i++) {
++		run = (k_used[i / 8] & 1u << (i % 8)) ? 0 : run + 1;
++		if (run == pages) {
++			uint32_t first = i + 1 - pages;
++
++			for (uint32_t j = first; j <= i; j++) {
++				k_used[j / 8] |= (uint8_t)(1u << (j % 8));
++			}
++			return KEEP_VA_BASE + 4096ull * first;
++		}
++	}
++	return 0;
++}
++
++void
++hakios_mali_gpu_address_free(uint64_t address, uint64_t size)
++{
++	uint32_t first = (uint32_t)((address - KEEP_VA_BASE) / 4096), pages = (uint32_t)((size + 4095) / 4096);
++
++	for (uint32_t j = first; j < first + pages && j < KEEP_VA_PAGES; j++) {
++		k_used[j / 8] &= (uint8_t)~(1u << (j % 8));
++	}
++}
++
++bool
++hakios_mali_gpu_map(uint64_t address, uint64_t phys, bool read_only)
++{
++	uint64_t off = address - KEEP_VA_BASE, idx2 = off >> 21, *l3;
++
++	if (address < KEEP_VA_BASE || off >= 4096ull * KEEP_VA_PAGES || (phys & 4095) != 0) {
++		return false;
++	}
++	l3 = k_l3[idx2];
++	if (l3 == NULL) {
++		uint64_t pa;
++
++		l3 = k_l3[idx2] = k_table(&pa);
++		if (l3 == NULL) {
++			return false;
++		}
++		k_l2[address >> 30][(address >> 21) & 511] = (pa & PTE_ADDRESS) | PTE_TABLE;
++		to_memory((vm_offset_t)&k_l2[address >> 30][(address >> 21) & 511], 8);
++	}
++	l3[(address >> 12) & 511] = (phys & PTE_ADDRESS) | PTE_ACCESS_FLAG | (read_only ? 3ull << 6 : PTE_ACCESS_RW) |
++	    PTE_PAGE;               /* memory kind 0 (non-cacheable); executable */
++	to_memory((vm_offset_t)&l3[(address >> 12) & 511], 8);
++	return true;
++}
++
++void
++hakios_mali_gpu_mapped(void)
++{
++	k_flush();
++}
++
++void
++hakios_mali_gpu_unmap(uint64_t address, uint64_t size)
++{
++	for (uint64_t a = address; a < address + size; a += 4096) {
++		uint64_t off = a - KEEP_VA_BASE, *l3;
++
++		if (a < KEEP_VA_BASE || off >= 4096ull * KEEP_VA_PAGES || (l3 = k_l3[off >> 21]) == NULL) {
++			continue;
++		}
++		l3[(a >> 12) & 511] = 0;
++		to_memory((vm_offset_t)&l3[(a >> 12) & 511], 8);
++	}
++	k_flush();
++}
++
++void
++hakios_mali_gpu_to_memory(void *start, uint64_t size)
++{
++	if (start != NULL && size != 0) {
++		to_memory((vm_offset_t)start, size);
++	}
++	__asm__ volatile ("dsb sy" : : : "memory");
++}
++
++uint32_t
++hakios_mali_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
++{
++	uint64_t jc = count ? addresses[0] : 0;
++	int slot = count && (words[0] & 1) ? 0 : 1;     /* PANFROST_JD_REQ_FS: fragment jobs on slot 0, the rest on 1 */
++
++	uint32_t fence;
++
++	if (!kept || jc == 0) {
++		return 0;
++	}
++	k_queue_init();
++	lck_mtx_lock(&k_lock);
++	/*
++	 * Queued, not waited for (runs 100-101: a frame of CoreAnimation's is up to 15 render passes, and each waited here
++	 * for the GPU to finish the one before -- 48-91 ms a frame while swiping, the GPU busy for a few of them). The
++	 * jobs run one after the other in the order given, which is every order Panfrost asks for; the queue's thread
++	 * starts the next as soon as one is done. Only a full queue is waited on.
++	 */
++	for (uint64_t began = mach_absolute_time(), ns; k_poll(), k_queued == K_QUEUE;) {
++		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++		if (ns >= KEEP_SUBMIT_MS * NSEC_PER_MSEC) {
++			k_recover();
++			break;
++		}
++		lck_mtx_unlock(&k_lock);
++		delay_for_interval(KEEP_ASK_US, NSEC_PER_USEC);
++		lck_mtx_lock(&k_lock);
++	}
++	fence = ++k_fence;
++	if (k_fence == 0) {
++		fence = k_fence = 1;
++	}
++	if (k_busy_slot < 0 && k_queued == 0) {
++		k_start(slot, jc, fence);
++	} else {
++		k_queue[(k_queue_first + k_queued) % K_QUEUE] = (struct k_job){ jc, fence, slot };
++		k_queued++;
++	}
++	thread_wakeup((event_t)&k_queued);
++	lck_mtx_unlock(&k_lock);
++	return fence;
++}
++
++/* a job onto the GPU now (k_lock held, the GPU idle) */
++static void
++k_start(int slot, uint64_t jc, uint32_t fence)
++{
++	P(JS(slot) + JS_HEAD_NEXT_LO, (uint32_t)jc);
++	P(JS(slot) + JS_HEAD_NEXT_HI, (uint32_t)(jc >> 32));
++	P(JS(slot) + JS_AFFINITY_NEXT_LO, (uint32_t)shader_present);
++	P(JS(slot) + JS_AFFINITY_NEXT_HI, (uint32_t)(shader_present >> 32));
++	P(JS(slot) + JS_CONFIG_NEXT, 0 /* AS 0 */ | JS_CONFIG_START_FLUSH_CLEAN_INVALIDATE |
++	    JS_CONFIG_END_FLUSH_CLEAN_INVALIDATE | JS_CONFIG_THREAD_PRI(8));
++	k_busy_fence = fence;
++	k_busy_slot = slot;
++	k_busy_since = mach_absolute_time();
++	k_jobs++;
++	P(JS(slot) + JS_COMMAND_NEXT, JS_COMMAND_START);
++}
++
++/* the next queued job onto the GPU, if it is idle (k_lock held) */
++static void
++k_start_next(void)
++{
++	if (k_busy_slot < 0 && k_queued != 0 && kept) {
++		struct k_job j = k_queue[k_queue_first];
++
++		k_queue_first = (k_queue_first + 1) % K_QUEUE;
++		k_queued--;
++		k_start(j.slot, j.jc, j.fence);
++	}
++}
++
++/* The queue's thread: while a job runs, it looks every KEEP_ASK_US whether it is done and starts the next. */
++static void
++k_queue_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	lck_mtx_lock(&k_lock);
++	for (;;) {
++		k_poll();
++		if (k_busy_slot >= 0) {
++			lck_mtx_unlock(&k_lock);
++			delay_for_interval(KEEP_ASK_US, NSEC_PER_USEC);
++			lck_mtx_lock(&k_lock);
++		} else {
++			(void)lck_mtx_sleep(&k_lock, LCK_SLEEP_DEFAULT, (event_t)&k_queued, THREAD_UNINT);
++		}
++	}
++}
++
++static void
++k_queue_init(void)
++{
++	thread_t thread;
++
++	if (k_queue_started) {
++		return;
++	}
++	k_queue_started = true;
++	if (kernel_thread_start(k_queue_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++bool
++hakios_mali_gpu_done(uint32_t fence)
++{
++	bool done;
++
++	lck_mtx_lock(&k_lock);
++	k_poll();
++	done = (int32_t)(fence - k_done) <= 0;
++	lck_mtx_unlock(&k_lock);
++	return done;
++}
++
++uint32_t
++hakios_mali_gpu_last(void)
++{
++	return k_fence;
++}
++
++void
++hakios_mali_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(k_worked_abs, &ns);
++	*microseconds = ns / 1000;
++	*submissions = k_jobs;
++	for (int i = 0; i < 7; i++) {
++		by[i] = 0;
++	}
++}
++
++void
++hakios_mali_gpu_report(const char *why)
++{
++	say("mali: %s: %u jobs, %u failed; running %u on slot %d; GPU_STATUS %#x, job raw %#x, MMU raw %#x\n", why, k_jobs,
++	    k_faults, k_busy_fence, k_busy_slot, G(GPU_STATUS), G(JOB_IRQ_RAWSTAT), G(MMU_IRQ_RAWSTAT));
++}
++
++void
++hakios_mali_gpu_stop(void)
++{
++	kept = false;
++	if (mali != 0) {
++		power_off();
++	}
++}
++
++extern void HakiosGPUStartMali(void);
++
++/* ---- the GPU's clock: a governor (boot-arg mali_gov=1; owner's OK, 14 Nov) ------------------------------------- */
++
++/*
++ * S-BOOT leaves the Mali-G77 at 260 MHz ("start clock" in Samsung's tree, gpu_dvfs_start_clock 0x3f7a0) and nothing
++ * raised it: heavy frames took 24 ms while swiping (14 Nov). Samsung's own table (exynos9830.dts gpu_dvfs_table, the
++ * clocks in kHz): 800000 (gpu_max_clock), 702000, 572000, 455000, 377000, 260000, 156000 (gpu_min_clock); its Android
++ * governor is "interactive". This one, every 32 ms, from how long the GPU worked (k_worked_abs):
++ *   busy 25% or more  -> straight to the top (mali_gov_max, default 800000)
++ *   between           -> as it is
++ *   under 10% for 300 ms -> mali_gov_min (default 260000, S-BOOT's; 156000 for the coolest idle)
++ * The clock is asked of the APM as Samsung's cal_dfs_set_rate does: channel 5 (acpm_dvfs), {10 (g3d_cmu_cal_id
++ * 0xb04000a & 0xffff), kHz, FREQ_REQ 0, 0}; the APM sets the PLL and the voltage. Every change is checked by reading
++ * the G3D PLL back. Heat: above mali_gov_hot (default 52 C) on the GPU's zone the top is 572 MHz; the kernel's heat
++ * guard (exynos_thermal_stop) powers off as before.
++ */
++extern int hakios_exynos_acpm(uint32_t channel, uint32_t cmd[4]);
++
++static const uint32_t gov_khz[] = { 156000, 260000, 377000, 455000, 572000, 702000, 800000 };
++#define GOV_LEVELS      (sizeof(gov_khz) / sizeof(gov_khz[0]))
++#define GOV_TICK_MS     32
++static thread_call_t gov_call;
++static int gov_level = -1, gov_min = 1, gov_max = GOV_LEVELS - 1, gov_hot_c = 52;
++static uint64_t gov_last_worked, gov_last_at;
++static uint32_t gov_idle_ms, gov_changes;
++static uint64_t gov_ms_at[GOV_LEVELS];
++static thread_call_t gov_boost_call;
++static volatile uint64_t gov_boost_until;       /* mach time: busy whatever the load, until then (a touch) */
++extern void (*hakios_touch_boost)(void);
++
++static uint32_t
++gov_pll_mhz(void)
++{
++	uint32_t con3 = rd(cmu_top + PLL_CON3_PLL_G3D);
++	uint32_t m = (con3 >> 16) & 0x3ff, p = (con3 >> 8) & 0x3f, s = con3 & 7;
++
++	return p ? (uint32_t)(26ull * m / ((uint64_t)p << s)) : 0;
++}
++
++static int
++gov_level_of(uint32_t khz)
++{
++	int best = 0;
++
++	for (int i = 0; i < (int)GOV_LEVELS; i++) {
++		if (gov_khz[i] <= khz) {
++			best = i;
++		}
++	}
++	return best;
++}
++
++static void
++gov_set(int level, const char *why)
++{
++	uint32_t q[4] = { ACPM_DVFS_G3D, gov_khz[level], 0 /* FREQ_REQ */, 0 };
++	int r = hakios_exynos_acpm(ACPM_CH_DVFS, q);
++	uint32_t mhz = gov_pll_mhz();
++
++	if (gov_changes++ < 40) {
++		say("mali: gov: %s: %u MHz asked (APM %d), the G3D PLL runs at %u MHz now\n", why, gov_khz[level] / 1000, r, mhz);
++	}
++	gov_level = level;
++}
++
++static void
++gov_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	uint64_t now = mach_absolute_time(), worked = k_worked_abs, busy_ns, all_ns, deadline;
++	uint32_t pct;
++	int top = gov_max, want = gov_level;
++
++	if (!kept) {
++		return;                 /* the GPU is off: nothing to clock */
++	}
++	absolutetime_to_nanoseconds(worked - gov_last_worked, &busy_ns);
++	absolutetime_to_nanoseconds(now - gov_last_at, &all_ns);
++	gov_last_worked = worked;
++	gov_last_at = now;
++	pct = all_ns ? (uint32_t)(busy_ns * 100 / all_ns) : 0;
++	if (g3d_celsius() >= gov_hot_c && top > gov_level_of(572000)) {
++		top = gov_level_of(572000);
++	}
++	if (pct >= 25 || now < gov_boost_until) {
++		want = top;
++		gov_idle_ms = 0;
++	} else if (pct < 10) {
++		gov_idle_ms += GOV_TICK_MS;
++		if (gov_idle_ms >= 300) {
++			want = gov_min;
++		}
++	} else {
++		gov_idle_ms = 0;
++	}
++	if (want > top) {
++		want = top;
++	}
++	if (gov_level >= 0) {
++		gov_ms_at[gov_level] += GOV_TICK_MS;
++	}
++	if (want != gov_level) {
++		gov_set(want, pct >= 25 ? "busy" : "idle");
++	}
++	clock_interval_to_deadline(GOV_TICK_MS, NSEC_PER_MSEC, &deadline);
++	thread_call_enter_delayed(gov_call, deadline);
++}
++
++/* a touch: the top clock at once (the touch path must not wait for the APM: this runs in a thread call) */
++static void
++gov_boost(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	int top = gov_max;
++
++	if (g3d_celsius() >= gov_hot_c && top > gov_level_of(572000)) {
++		top = gov_level_of(572000);
++	}
++	if (kept && gov_level != top) {
++		gov_set(top, "touch");
++	}
++}
++
++static void
++gov_touch(void)
++{
++	uint64_t hold;
++
++	nanoseconds_to_absolutetime(300 * NSEC_PER_MSEC, &hold);
++	gov_boost_until = mach_absolute_time() + hold;
++	gov_idle_ms = 0;
++	if (gov_level != gov_max) {
++		thread_call_enter(gov_boost_call);
++	}
++}
++
++/* every minute: how long at each clock (mali_gov=1) */
++static thread_call_t gov_report_call;
++
++static void
++gov_report(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	uint64_t deadline;
++
++	say("mali: gov: seconds at 156/260/377/455/572/702/800 MHz: %llu %llu %llu %llu %llu %llu %llu; now %u MHz, G3D %d C\n",
++	    gov_ms_at[0] / 1000, gov_ms_at[1] / 1000, gov_ms_at[2] / 1000, gov_ms_at[3] / 1000, gov_ms_at[4] / 1000,
++	    gov_ms_at[5] / 1000, gov_ms_at[6] / 1000, gov_pll_mhz(), g3d_celsius());
++	clock_interval_to_deadline(60, NSEC_PER_SEC, &deadline);
++	thread_call_enter_delayed(gov_report_call, deadline);
++}
++
++static void
++gov_start(void)
++{
++	uint32_t value;
++
++	if (!PE_parse_boot_argn("mali_gov", &value, sizeof(value)) || value == 0) {
++		return;
++	}
++	if (PE_parse_boot_argn("mali_gov_max", &value, sizeof(value)) && value >= 156000 && value <= 800000) {
++		gov_max = gov_level_of(value);
++	}
++	if (PE_parse_boot_argn("mali_gov_min", &value, sizeof(value)) && value >= 156000 && value <= 800000) {
++		gov_min = gov_level_of(value);
++	}
++	if (PE_parse_boot_argn("mali_gov_hot", &value, sizeof(value)) && value >= 40 && value <= 60) {
++		gov_hot_c = (int)value;
++	}
++	if (gov_min > gov_max) {
++		gov_min = gov_max;
++	}
++	say("mali: gov: on: %u..%u MHz, 572 MHz at most from %d C; the G3D PLL runs at %u MHz\n",
++	    gov_khz[gov_min] / 1000, gov_khz[gov_max] / 1000, gov_hot_c, gov_pll_mhz());
++	gov_level = gov_level_of(gov_pll_mhz() * 1000);
++	gov_last_worked = k_worked_abs;
++	gov_last_at = mach_absolute_time();
++	gov_call = thread_call_allocate_with_priority(gov_tick, NULL, THREAD_CALL_PRIORITY_HIGH);
++	gov_report_call = thread_call_allocate(gov_report, NULL);
++	gov_boost_call = thread_call_allocate_with_priority(gov_boost, NULL, THREAD_CALL_PRIORITY_HIGH);
++	hakios_touch_boost = gov_touch;
++	gov_tick(NULL, NULL);
++	gov_report(NULL, NULL);
++}
++
++/* ---- the steps ----------------------------------------------------------------------------------- */
++
++static bool (*const steps[])(void) = { step_look, step_reset, step_power, step_space, step_job };
++static const char *const names[] = { "look", "soft reset", "power on", "an address space", "a write-value job" };
++#define STEPS   (sizeof(steps) / sizeof(steps[0]))
++
++/*
++ * Boot-arg dpu_probe=1 (read only): how S-BOOT left the display, for showing the window server's surfaces without a copy
++ * (as Scion's fb_zc on the S9). Samsung's dpu30 (cal_9830 regs-decon.h, regs-dpp.h) and the S20's tree: DECON0 at
++ * 0x19050000 (default_win 5, default_ch 0), the first DPP at 0x19091000 with its IDMA at 0x19041000. Each register read
++ * both ways -- through the window and through a kernel mapping -- since the hypervisor skips some loads (run 82).
++ */
++#define DECON0_PA               0x19050000ull
++#define IDMA0_PA                0x19041000ull
++static void dpu_probe(void);
++static void
++dpu_probe(void)
++{
++	static const struct { uint32_t off; const char *name; } decon[] = {
++		{ 0x0000, "GLOBAL_CONTROL" }, { 0x0060, "SHADOW_REG_UPDATE_REQ" }, { 0x0070, "HW_SW_TRIG_CONTROL" },
++		{ 0x0214, "DATA_PATH_CONTROL_0" }, { 0x0218, "DATA_PATH_CONTROL_1" }, { 0x0230, "DATA_PATH_CONTROL_2" },
++		{ 0x1000 + 5 * 0x30, "WIN_CONTROL_0(5)" }, { 0x1004 + 5 * 0x30, "WIN_CONTROL_1(5)" },
++		{ 0x1008 + 5 * 0x30, "WIN_START_POSITION(5)" }, { 0x100c + 5 * 0x30, "WIN_END_POSITION(5)" },
++	}, idma[] = {
++		{ 0x0000, "IDMA_ENABLE" }, { 0x0004, "IDMA_IRQ" }, { 0x0008, "IDMA_IN_CON" }, { 0x0010, "IDMA_SRC_SIZE" },
++		{ 0x0014, "IDMA_SRC_OFFSET" }, { 0x0018, "IDMA_IMG_SIZE" }, { 0x0040, "IDMA_IN_BASE_ADDR_Y8" },
++		{ 0x0308, "IDMA_IN_REQ_DEST" },
++	};
++	vm_offset_t dw = low_map(DECON0_PA, 2), iw = low_map(IDMA0_PA, 1);
++	vm_offset_t dk = ml_io_map(DECON0_PA, 0x4000), ik = ml_io_map(IDMA0_PA & ~0x3fffull, 0x4000) + (IDMA0_PA & 0x3fff);
++
++	if (dw == 0 || iw == 0 || dk == 0 || ik == 0) {
++		say("dpu_probe: could not map the DECON or the IDMA\n");
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(decon) / sizeof(decon[0]); i++) {
++		uint32_t off = decon[i].off;
++		uint32_t viaw = rd(dw + off);
++
++		say("dpu_probe: DECON0 %-22s +%#06x = %#010x (kernel mapping %#010x)\n", decon[i].name, off, viaw,
++		    *(volatile uint32_t *)(dk + off));
++	}
++	for (unsigned i = 0; i < sizeof(idma) / sizeof(idma[0]); i++) {
++		say("dpu_probe: IDMA0  %-22s +%#06x = %#010x (kernel mapping %#010x)\n", idma[i].name, idma[i].off,
++		    rd(iw + idma[i].off), *(volatile uint32_t *)(ik + idma[i].off));
++	}
++}
++
++void
++hakios_mali_init(void)
++{
++	uint32_t value = 0, done = 0, back = 0;
++
++	if (PE_parse_boot_argn("dpu_probe", &value, sizeof(value)) && value) {
++		dpu_probe();
++		value = 0;
++	}
++	if (!PE_parse_boot_argn("mali", &last_step, sizeof(last_step)) || last_step == 0) {
++		return;
++	}
++	if (last_step > STEPS) {
++		last_step = STEPS;
++	}
++	/* lower only: 60 C is the most the GPU is let reach here (the heat guard powers the phone off at 70) */
++	if (PE_parse_boot_argn("mali_hot", &value, sizeof(value)) && value >= 30 && value <= 60) {
++		hot_c = value;
++	}
++	mali = low_map(MALI_PA, MALI_SIZE / 4096);
++	pmu = low_map(PMU_G3D_PA, 1);
++	cmu_top = low_map(CMU_TOP_PA, 1);
++	if (mali == 0 || pmu == 0 || cmu_top == 0) {
++		say("mali: could not map the GPU, the PMU or the clock controller\n");
++		return;
++	}
++	/* bisect mark: bit 29 of AS7_TRANSTAB_LO, the driver's start (input init) */
++	wr(mali + AS(7) + AS_TRANSTAB_LO, rd(mali + AS(7) + AS_TRANSTAB_LO) | 0x20000000u);
++	say("mali: steps 1 to %u (of %u); no power on at or above %u C\n", last_step, (unsigned)STEPS, hot_c);
++	for (uint32_t s = 1; s <= last_step; s++) {
++		say("mali: step %u: %s\n", s, names[s - 1]);
++		if (!steps[s - 1]()) {
++			say("mali: step %u: FAILED; the steps after it are not attempted\n", s);
++			break;
++		}
++		say("mali: step %u: done\n", s);
++		done = s;
++	}
++	/* mali_keep=1: with the GPU powered (step 3 done), kept on for the system (HakiosGPU, Panfrost's interface) */
++	if (done >= 3 && PE_parse_boot_argn("mali_keep", &value, sizeof(value)) && value) {
++		if (keep_space()) {
++			kept = true;
++			say("mali: THE GPU STAYS ON for the system to draw with: the service HakiosGPU (Panfrost's interface)\n");
++			HakiosGPUStartMali();
++			gov_start();
++			return;
++		}
++		say("mali: not kept: no address space for it\n");
++	}
++	if (last_step >= 2 && done >= 1) {
++		power_off();
++		if (done < last_step || last_step >= 4) {
++			soft_reset();           /* nothing of ours (tables, a job) is left in the GPU's hands */
++		}
++	}
++	clock_stop();
++	if (cycled) {
++		domain_off();           /* the domain left off, Samsung's way (S-BOOT left it on with the GPU's PLL stopped) */
++		cycled = false;
++	}
++	say("mali: over: %u of %u steps done%s; G3D %d C\n", done, last_step,
++	    done == STEPS ? ": THE GPU RAN A JOB" : "", g3d_celsius());
++	if (PE_parse_boot_argn("mali_return", &back, sizeof(back)) && back) {
++		say("mali: back to the loader (mali_return)\n");
++		loader_return();
++	}
++}
++
++/* the heat guard's or a run's end: the GPU's cores off, if they were left on */
++void
++hakios_mali_stop(void)
++{
++	kept = false;
++	if (powered && mali != 0) {
++		power_off();
++	}
++	clock_stop();
++	if (cycled) {
++		domain_off();
++		cycled = false;
++	}
++}
++
++/*
++ * The write test as early as the kernel can do it (before nearly every driver), with mali=N: run 48 found the kernel's
++ * mapping right (0x18500000, Device-nGnRnE, writable) yet its stores lost and quick (10 ns, a read 300 ns), while the
++ * loader's stores before and after a kernel run land. Does the kernel lose them from the start, or only later?
++ */
++__startup_func
++static void
++mali_early_write_test(void)
++{
++	uint32_t n = 0, seen, after;
++	vm_offset_t m;
++	uint64_t t0, t1, ns;
++
++	/* the diagnostics of runs 50-69 (mali_early=1 only: the driver itself goes through the low window now) */
++	if (!PE_parse_boot_argn("mali_early", &n, sizeof(n)) || n == 0) {
++		return;
++	}
++	m = ml_io_map(MALI_PA, MALI_SIZE);
++	if (m == 0) {
++		return;
++	}
++	/* bisect mark (loader_return.c's loader_checkpoint): bit 30 of AS7_TRANSTAB_LO, the EARLY_BOOT hook */
++	wr(m + AS(7) + AS_TRANSTAB_LO, rd(m + AS(7) + AS_TRANSTAB_LO) | 0x40000000u);
++	{
++		/*
++		 * A stale TLB entry for this VA? The loader writes the GPU fine with the kernel's whole translation context
++		 * (TCR, MAIR, SCTLR, PAN, a TTBR1 table), so the kernel's page tables are right but what the CPU uses may
++		 * not be them. Invalidate this core's TLB, then the write.
++		 */
++		uint32_t s1, s2;
++
++		__asm__ volatile ("dsb sy; tlbi vmalle1; dsb sy; isb" : : : "memory");
++		wr(m + AS(2) + AS_TRANSTAB_LO, 0x5a5a5000u);
++		s1 = rd(m + AS(2) + AS_TRANSTAB_LO);
++		__asm__ volatile ("dsb sy; tlbi vmalle1is; dsb sy; isb" : : : "memory");
++		wr(m + AS(3) + AS_TRANSTAB_LO, 0x6b6b6000u);
++		s2 = rd(m + AS(3) + AS_TRANSTAB_LO);
++		say("mali: after tlbi vmalle1: wrote 0x5a5a5000, read %#x; after tlbi vmalle1is: wrote 0x6b6b6000, read %#x\n",
++		    s1, s2);
++	}
++	{
++		/*
++		 * The write through a table of our own in TTBR0 for a moment (interrupts are off this early): VA 0x40000000
++		 * -> the GPU's MMU page (0x18502000), Device-nGnRnE (the kernel's MAIR index 3), as the loader maps it. If
++		 * this lands and the kernel's own mapping does not, the kernel's TTBR1 tables are what differs.
++		 */
++		static uint64_t t_l1[512] __attribute__((aligned(4096)));
++		static uint64_t t_l2[512] __attribute__((aligned(4096)));
++		static uint64_t t_l3[512] __attribute__((aligned(4096)));
++		uint64_t old0, got = 0, l1pa = kvtophys((vm_offset_t)t_l1);
++
++		t_l1[1] = kvtophys((vm_offset_t)t_l2) | 3;
++		t_l2[0] = kvtophys((vm_offset_t)t_l3) | 3;
++		t_l3[0] = 0x18502000ull | 3ull << 2 | 1ull << 10 | 1ull << 53 | 1ull << 54 | 3;
++		to_memory((vm_offset_t)t_l1, 4096);
++		to_memory((vm_offset_t)t_l2, 4096);
++		to_memory((vm_offset_t)t_l3, 4096);
++		__asm__ volatile ("mrs %0, ttbr0_el1" : "=r" (old0));
++		__asm__ volatile (
++		    "  dsb sy\n"
++		    "  msr ttbr0_el1, %[t]\n"
++		    "  isb\n"
++		    "  tlbi vmalle1\n"
++		    "  dsb sy\n"
++		    "  isb\n"
++		    "  str %w[v], [%[a]]\n"
++		    "  dsb sy\n"
++		    "  ldr %w[g], [%[a]]\n"
++		    "  msr ttbr0_el1, %[o]\n"
++		    "  isb\n"
++		    "  tlbi vmalle1\n"
++		    "  dsb sy\n"
++		    "  isb\n"
++		    : [g] "=&r" (got)
++		    : [t] "r" (l1pa), [v] "r" (0x7c7c7000u), [a] "r" (0x40000000ull + 0x4c0), [o] "r" (old0)
++		    : "memory");
++		say("mali: through a TTBR0 table of our own (tables at %#llx): wrote 0x7c7c7000 to AS3, read %#llx; the kernel's "
++		    "TTBR0 was %#llx\n", l1pa, got, old0);
++
++		/*
++		 * Run 60: that lands. The kernel's own entry above the GPU's page carries table attributes our table has not
++		 * (its level-1 entry 0x380000092794c003: PXNTable, UXNTable, APTable[0] = no EL0 access). The same write with
++		 * each of them set in our level-1 entry, one at a time, to AS4..AS6.
++		 */
++		static const uint64_t attrs[3] = { 1ull << 61, 1ull << 59 | 1ull << 60, 7ull << 59 };
++		for (int k = 0; k < 3; k++) {
++			uint64_t g2 = 0;
++
++			t_l1[1] = kvtophys((vm_offset_t)t_l2) | 3 | attrs[k];
++			to_memory((vm_offset_t)t_l1, 4096);
++			__asm__ volatile (
++			    "  dsb sy\n"
++			    "  msr ttbr0_el1, %[t]\n"
++			    "  isb\n"
++			    "  tlbi vmalle1\n"
++			    "  dsb sy\n"
++			    "  isb\n"
++			    "  str %w[v], [%[a]]\n"
++			    "  dsb sy\n"
++			    "  ldr %w[g], [%[a]]\n"
++			    "  msr ttbr0_el1, %[o]\n"
++			    "  isb\n"
++			    "  tlbi vmalle1\n"
++			    "  dsb sy\n"
++			    "  isb\n"
++			    : [g] "=&r" (g2)
++			    : [t] "r" (l1pa), [v] "r" (0x1d1d1000u + (uint32_t)k), [a] "r" (0x40000000ull + 0x500 + 0x40 * k),
++			      [o] "r" (old0)
++			    : "memory");
++			say("mali:   level-1 attributes %#llx: wrote %#x, read %#llx\n", attrs[k], 0x1d1d1000u + k, g2);
++		}
++		/* and the kernel's own entries for the GPU's VA, for the record */
++		{
++			uint64_t ttbr1, d1, d2;
++			vm_offset_t va = m + 0x2000;
++
++			__asm__ volatile ("mrs %0, ttbr1_el1" : "=r" (ttbr1));
++			d1 = ml_phys_read_double_64((ttbr1 & 0x0000fffffffffffeull) + ((va >> 30) & 0xff) * 8);
++			d2 = ml_phys_read_double_64((d1 & 0x0000fffffffff000ull) + ((va >> 21) & 0x1ff) * 8);
++			say("mali:   the kernel's entries for %#lx: level 1 %#llx, level 2 %#llx, level 3 %#llx\n", (unsigned long)va,
++			    d1, d2, ml_phys_read_double_64((d2 & 0x0000fffffffff000ull) + ((va >> 12) & 0x1ff) * 8));
++			/*
++			 * Run 61: the attributes do not matter. Which table pages do? (a) our level 1 -> the kernel's own level-2
++			 * table: VA 0x40000000 + (va & 0x3fffffff) then walks the kernel's level 2 and level 3; (b) our level 1
++			 * and 2 -> the kernel's own level-3 table: VA 0x40000000 + (va & 0x1fffff) walks its level 3 only.
++			 */
++			for (int k = 0; k < 2; k++) {
++				uint64_t g4 = 0, a = 0x40000000ull;
++
++				if (k == 0) {
++					t_l1[1] = (d1 & 0x0000fffffffff000ull) | 3;
++					a += va & 0x3fffffffull;
++				} else {
++					t_l1[1] = kvtophys((vm_offset_t)t_l2) | 3;
++					t_l2[0] = (d2 & 0x0000fffffffff000ull) | 3;
++					a += va & 0x1fffffull;
++				}
++				to_memory((vm_offset_t)t_l1, 4096);
++				to_memory((vm_offset_t)t_l2, 4096);
++				__asm__ volatile (
++				    "  dsb sy\n"
++				    "  msr ttbr0_el1, %[t]\n"
++				    "  isb\n"
++				    "  tlbi vmalle1\n"
++				    "  dsb sy\n"
++				    "  isb\n"
++				    "  str %w[v], [%[a]]\n"
++				    "  dsb sy\n"
++				    "  ldr %w[g], [%[a]]\n"
++				    "  msr ttbr0_el1, %[o]\n"
++				    "  isb\n"
++				    "  tlbi vmalle1\n"
++				    "  dsb sy\n"
++				    "  isb\n"
++				    : [g] "=&r" (g4)
++				    : [t] "r" (l1pa), [v] "r" (0x2e2e2000u + (uint32_t)k), [a] "r" (a + 0x580 + 0x40 * k),
++				      [o] "r" (old0)
++				    : "memory");
++				say("mali:   through %s: wrote %#x, read %#llx\n", k == 0 ? "the kernel's level-2 and level-3 tables" :
++				    "the kernel's level-3 table", 0x2e2e2000u + k, g4);
++			}
++			/*
++			 * Run 62: both land. Left: the kernel's level-1 page itself, and TTBR1 as such. (c) TTBR0 = the kernel's
++			 * TTBR1 value (its level-1 page, CnP and all), VA = va's low 38 bits: the same walk, from the lower half.
++			 */
++			{
++				uint64_t g5 = 0, a = (va & 0x3fffffffffull) + 0x500;
++
++				say("mali:   the kernel's TTBR1 is %#llx\n", ttbr1);
++				__asm__ volatile (
++				    "  dsb sy\n"
++				    "  msr ttbr0_el1, %[t]\n"
++				    "  isb\n"
++				    "  tlbi vmalle1\n"
++				    "  dsb sy\n"
++				    "  isb\n"
++				    "  str %w[v], [%[a]]\n"
++				    "  dsb sy\n"
++				    "  ldr %w[g], [%[a]]\n"
++				    "  msr ttbr0_el1, %[o]\n"
++				    "  isb\n"
++				    "  tlbi vmalle1\n"
++				    "  dsb sy\n"
++				    "  isb\n"
++				    : [g] "=&r" (g5)
++				    : [t] "r" (ttbr1), [v] "r" (0x3f3f3000u), [a] "r" (a), [o] "r" (old0)
++				    : "memory");
++				say("mali:   through the kernel's level-1 page from TTBR0: wrote 0x3f3f3000, read %#llx\n", g5);
++				/* (d) and once more through the kernel's own upper-half VA, right after a full TLB invalidate */
++				__asm__ volatile ("dsb sy; tlbi vmalle1; dsb sy; isb" : : : "memory");
++				wr(va + 0x540, 0x4a4a4000u);
++				say("mali:   through the kernel's own VA %#lx: wrote 0x4a4a4000, read %#x\n", (unsigned long)(va + 0x540),
++				    rd(va + 0x540));
++				/*
++				 * The loader writes through these very tables (TTBR1 0x927915000, the kernel's VA, TCR, MAIR, SCTLR,
++				 * PAN) and its write lands; the kernel's does not, except through TTBR0. The one register left that
++				 * differs: TTBR0 (TCR.A1 = 0: the ASID comes from it). The kernel's VA again, with TTBR0 = (e) our
++				 * table, (f) the kernel's own TTBR0 with ASID 1.
++				 */
++				for (int k = 0; k < 2; k++) {
++					uint64_t g6 = 0, t0 = k == 0 ? l1pa : (old0 & 0x0000ffffffffffffull) | 1ull << 48;
++
++					__asm__ volatile (
++					    "  dsb sy\n"
++					    "  msr ttbr0_el1, %[t]\n"
++					    "  isb\n"
++					    "  tlbi vmalle1\n"
++					    "  dsb sy\n"
++					    "  isb\n"
++					    "  str %w[v], [%[a]]\n"
++					    "  dsb sy\n"
++					    "  ldr %w[g], [%[a]]\n"
++					    "  msr ttbr0_el1, %[o]\n"
++					    "  isb\n"
++					    "  tlbi vmalle1\n"
++					    "  dsb sy\n"
++					    "  isb\n"
++					    : [g] "=&r" (g6)
++					    : [t] "r" (t0), [v] "r" (0x5b5b5000u + (uint32_t)k), [a] "r" (va + 0x580 + 0x40 * k),
++					      [o] "r" (old0)
++					    : "memory");
++					say("mali:   the kernel's own VA with TTBR0 = %#llx: wrote %#x, read %#llx\n", t0, 0x5b5b5000u + k, g6);
++				}
++				/*
++				 * Run 65: both land. Which rule? (g) TTBR0 rewritten with its own value, (h) CnP set, ASID 0, (i) ASID
++				 * 0xff; and (j) TTBR0 = the kernel's table with ASID 1 left in place across ordinary P()/G() calls.
++				 */
++				{
++					static const uint64_t extra[3] = { 0, 1, 0xffull << 48 };
++					static const char *const label[3] = { "rewritten as it was", "with CnP", "with ASID 0xff" };
++
++					for (int k = 0; k < 3; k++) {
++						uint64_t g7 = 0, t0 = old0 | extra[k];
++
++						__asm__ volatile (
++						    "  dsb sy\n"
++						    "  msr ttbr0_el1, %[t]\n"
++						    "  isb\n"
++						    "  tlbi vmalle1\n"
++						    "  dsb sy\n"
++						    "  isb\n"
++						    "  str %w[v], [%[a]]\n"
++						    "  dsb sy\n"
++						    "  ldr %w[g], [%[a]]\n"
++						    "  msr ttbr0_el1, %[o]\n"
++						    "  isb\n"
++						    "  tlbi vmalle1\n"
++						    "  dsb sy\n"
++						    "  isb\n"
++						    : [g] "=&r" (g7)
++						    : [t] "r" (t0), [v] "r" (0x6c6c6000u + (uint32_t)k), [a] "r" (va + 0x400 + 0x40 * k),
++						      [o] "r" (old0)
++						    : "memory");
++						say("mali:   TTBR0 %s (%#llx): wrote %#x, read %#llx\n", label[k], t0, 0x6c6c6000u + k, g7);
++					}
++					__asm__ volatile ("dsb sy; msr ttbr0_el1, %0; isb; tlbi vmalle1; dsb sy; isb" : :
++					    "r" ((old0 & 0x0000ffffffffffffull) | 1ull << 48) : "memory");
++					wr(m + AS(0) + AS_TRANSTAB_LO, 0x7d7d7000u);
++					wr(m + AS(1) + AS_TRANSTAB_LO, 0x7e7e7000u);
++					say("mali:   (j) ASID 1 left in place, ordinary writes: AS0 read %#x, AS1 read %#x\n",
++					    rd(m + AS(0) + AS_TRANSTAB_LO), rd(m + AS(1) + AS_TRANSTAB_LO));
++					wr(m + AS(0) + AS_TRANSTAB_LO, 0);
++					wr(m + AS(1) + AS_TRANSTAB_LO, 0);
++					__asm__ volatile ("dsb sy; msr ttbr0_el1, %0; isb; tlbi vmalle1; dsb sy; isb" : : "r" (old0) : "memory");
++				}
++				/*
++				 * Run 66: TTBR0 rewritten with its own value lets the next store through, but a store a function call
++				 * later (j) is lost again. The window: k1 msr TTBR0 + isb + store (no tlbi); k2 tlbi + store (no msr);
++				 * k3 msr + tlbi + 64 nops + store; k4 msr + tlbi + a second store right after the first; k5 the store
++				 * alone. Each into its own AS register (AS2-AS7 table address), read back at once.
++				 */
++				{
++					uint64_t g[6] = { 0 };
++					vm_offset_t r = va + 0x480;     /* AS2 */
++
++					__asm__ volatile ("dsb sy; msr ttbr0_el1, %[o]; isb; str %w[v], [%[a]]; dsb sy; ldr %w[g], [%[a]]"
++					    : [g] "=&r" (g[0]) : [o] "r" (old0), [v] "r" (0x81810000u), [a] "r" (r) : "memory");
++					__asm__ volatile ("dsb sy; tlbi vmalle1; dsb sy; isb; str %w[v], [%[a]]; dsb sy; ldr %w[g], [%[a]]"
++					    : [g] "=&r" (g[1]) : [v] "r" (0x82820000u), [a] "r" (r + 0x40) : "memory");
++					__asm__ volatile ("dsb sy; msr ttbr0_el1, %[o]; isb; tlbi vmalle1; dsb sy; isb\n"
++					    ".rept 64\n nop\n .endr\n"
++					    "str %w[v], [%[a]]; dsb sy; ldr %w[g], [%[a]]"
++					    : [g] "=&r" (g[2]) : [o] "r" (old0), [v] "r" (0x83830000u), [a] "r" (r + 0x80) : "memory");
++					__asm__ volatile ("dsb sy; msr ttbr0_el1, %[o]; isb; tlbi vmalle1; dsb sy; isb\n"
++					    "str %w[v], [%[a]]; dsb sy\n"
++					    "str %w[v2], [%[a2]]; dsb sy; ldr %w[g], [%[a2]]"
++					    : [g] "=&r" (g[3]) : [o] "r" (old0), [v] "r" (0x84840000u), [a] "r" (r + 0xc0),
++					      [v2] "r" (0x85850000u), [a2] "r" (r + 0x100) : "memory");
++					g[4] = rd(r + 0xc0);
++					__asm__ volatile ("dsb sy; str %w[v], [%[a]]; dsb sy; ldr %w[g], [%[a]]"
++					    : [g] "=&r" (g[5]) : [v] "r" (0x86860000u), [a] "r" (r + 0x140) : "memory");
++					say("mali:   window: k1 msr+store %#llx, k2 tlbi+store %#llx, k3 msr+tlbi+64 nops+store %#llx, k4 first "
++					    "store %#llx second %#llx, k5 store alone %#llx\n", g[0], g[1], g[2], g[4], g[3], g[5]);
++					/*
++					 * Run 67: the loads inside those blocks came back as other registers' old contents: the stores (and
++					 * loads?) are handled by the hypervisor in software. Read back with rd() instead, one per case:
++					 * m1 msr TTBR0 + isb + store; m2 msr + tlbi + store; m3 msr + store, then a second store 64 nops on;
++					 * m4 a store in wr() right after an msr in its own asm.
++					 */
++					{
++						uint32_t q[5];
++
++						__asm__ volatile ("dsb sy; msr ttbr0_el1, %[o]; isb; str %w[v], [%[a]]; dsb sy"
++						    : : [o] "r" (old0), [v] "r" (0x91910000u), [a] "r" (r) : "memory");
++						q[0] = rd(r);
++						__asm__ volatile ("dsb sy; msr ttbr0_el1, %[o]; isb; tlbi vmalle1; dsb sy; isb; str %w[v], [%[a]]; dsb sy"
++						    : : [o] "r" (old0), [v] "r" (0x92920000u), [a] "r" (r + 0x40) : "memory");
++						q[1] = rd(r + 0x40);
++						__asm__ volatile ("dsb sy; msr ttbr0_el1, %[o]; isb; str %w[v], [%[a]]; dsb sy\n"
++						    ".rept 64\n nop\n .endr\n"
++						    "str %w[v2], [%[a2]]; dsb sy"
++						    : : [o] "r" (old0), [v] "r" (0x93930000u), [a] "r" (r + 0x80), [v2] "r" (0x94940000u),
++						      [a2] "r" (r + 0xc0) : "memory");
++						q[2] = rd(r + 0x80);
++						q[3] = rd(r + 0xc0);
++						__asm__ volatile ("dsb sy; msr ttbr0_el1, %[o]; isb" : : [o] "r" (old0) : "memory");
++						wr(r + 0x100, 0x95950000u);
++						q[4] = rd(r + 0x100);
++						say("mali:   by rd(): m1 msr+store %#x, m2 msr+tlbi+store %#x, m3 first %#x then 64 nops later %#x, "
++						    "m4 wr() after an msr %#x\n", q[0], q[1], q[2], q[3], q[4]);
++					}
++					/*
++					 * Run 68: erratic, and a second store a moment after a lost first one often lands. How many tries
++					 * does a write take until it reads back? 16 writes to AS0-AS7 LO/HI table addresses, plain wr()
++					 * each try (at most 200), then the same with TTBR0 rewritten before each try.
++					 */
++					for (int mode = 0; mode < 2; mode++) {
++						char line[200];
++						int at = 0, total = 0, worst = 0, failed = 0;
++
++						at += snprintf(line + at, sizeof(line) - at, "mali:   tries %s:", mode ? "with TTBR0 rewritten" : "plain");
++						for (int i = 0; i < 16; i++) {
++							vm_offset_t reg = va + 0x400 + 0x40 * (i / 2) + 4 * (i & 1);
++							uint32_t want = 0xa0000000u | (uint32_t)(mode << 20) | (uint32_t)(i << 12);
++							int t;
++
++							for (t = 1; t <= 200; t++) {
++								if (mode) {
++									__asm__ volatile ("dsb sy; msr ttbr0_el1, %0; isb" : : "r" (old0) : "memory");
++								}
++								wr(reg, want);
++								if (rd(reg) == want) {
++									break;
++								}
++							}
++							if (t > 200) {
++								failed++;
++							} else {
++								total += t;
++								worst = t > worst ? t : worst;
++							}
++							at += snprintf(line + at, sizeof(line) - at, " %d", t > 200 ? 0 : t);
++						}
++						say("%s; worst %d, failed %d\n", line, worst, failed);
++					}
++				}
++			}
++		}
++	}
++	{
++		/* ISR_EL1 bit 8: an SError pending (a bus error answer to a write lands there, masked in the kernel) */
++		uint64_t isr0, isr1, isr2, daif;
++
++		__asm__ volatile ("mrs %0, isr_el1" : "=r" (isr0));
++		__asm__ volatile ("mrs %0, daif" : "=r" (daif));
++		wr(m + AS(0) + AS_TRANSTAB_LO, 0x5a5a5000u);
++		__asm__ volatile ("isb; mrs %0, isr_el1" : "=r" (isr1));
++		wr(m + AS(0) + AS_TRANSTAB_LO, 0);
++		delay_for_interval(100, NSEC_PER_USEC);
++		__asm__ volatile ("isb; mrs %0, isr_el1" : "=r" (isr2));
++		say("mali: SError pending? ISR_EL1 before %#llx, after a GPU write %#llx, 100 us later %#llx (DAIF %#llx)\n",
++		    isr0, isr1, isr2, daif);
++	}
++	t0 = mach_absolute_time();
++	wr(m + AS(0) + AS_TRANSTAB_LO, 0x5a5a5000u);
++	t1 = mach_absolute_time();
++	seen = rd(m + AS(0) + AS_TRANSTAB_LO);
++	wr(m + AS(0) + AS_TRANSTAB_LO, 0);
++	after = rd(m + AS(0) + AS_TRANSTAB_LO);
++	absolutetime_to_nanoseconds(t1 - t0, &ns);
++	say("mali: EARLY write test: written 0x5a5a5000, read %#x; written 0, read %#x (the write took %llu ns): %s\n",
++	    seen, after, ns, seen == 0x5a5a5000u && after == 0 ? "WRITES REACH THE GPU THIS EARLY" : "lost already");
++	{
++		uint64_t sctlr, tcr, mair, el, mpidr;
++		uint32_t a, b, c;
++
++		__asm__ volatile ("mrs %0, sctlr_el1" : "=r" (sctlr));
++		__asm__ volatile ("mrs %0, tcr_el1" : "=r" (tcr));
++		__asm__ volatile ("mrs %0, mair_el1" : "=r" (mair));
++		__asm__ volatile ("mrs %0, CurrentEL" : "=r" (el));
++		__asm__ volatile ("mrs %0, mpidr_el1" : "=r" (mpidr));
++		say("mali: kernel CPU: EL%llu SCTLR %#llx TCR %#llx MAIR %#llx MPIDR %#llx\n", (el >> 2) & 3, sctlr, tcr, mair,
++		    mpidr);
++		/* other store forms: 64-bit (TRANSTAB_LO and _HI at once), store-release, a store pair */
++		__asm__ volatile ("dsb sy; str %0, [%1]; dsb sy" : : "r" (0x11111000ull), "r" (m + AS(0) + AS_TRANSTAB_LO) : "memory");
++		a = rd(m + AS(0) + AS_TRANSTAB_LO);
++		__asm__ volatile ("dsb sy; stlr %w0, [%1]; dsb sy" : : "r" (0x22222000u), "r" (m + AS(0) + AS_TRANSTAB_LO) : "memory");
++		b = rd(m + AS(0) + AS_TRANSTAB_LO);
++		__asm__ volatile ("dsb sy; stp %w0, %w0, [%1]; dsb sy" : : "r" (0x33333000u), "r" (m + AS(0) + AS_TRANSTAB_LO) : "memory");
++		c = rd(m + AS(0) + AS_TRANSTAB_LO);
++		wr(m + AS(0) + AS_TRANSTAB_LO, 0);
++		wr(m + AS(0) + AS_TRANSTAB_HI, 0);
++		say("mali: other stores: 64-bit -> %#x, store-release -> %#x, pair -> %#x\n", a, b, c);
++		/*
++		 * A marker left behind: AS 1's table address = 0x77777000, not put back. After the run the loader reads it
++		 * ("oem peek 18502440"): if it is there, the kernel's writes land and its READS are what is wrong.
++		 */
++		wr(m + AS(1) + AS_TRANSTAB_LO, 0x77777000u);
++		say("mali: marker written to AS 1 (0x18502440), the kernel reads it as %#x\n", rd(m + AS(1) + AS_TRANSTAB_LO));
++		/*
++		 * Timed with the generic timer (26 MHz), 1000 each: writes of 0 to the GIC distributor's ISPENDR0 (0x10101200:
++		 * writing 0 does nothing) and to the GPU's AS 1 table address, and reads of both. The loader (13 Nov): every
++		 * device write ~400 ns there, the GIC's and the GPU's alike; the kernel's GPU writes ~10 ns, and lost.
++		 */
++		{
++			vm_offset_t gic = ml_io_map(0x10101000u, 0x1000);
++			uint64_t t[5];
++
++			if (gic != 0) {
++				__asm__ volatile ("isb; mrs %0, cntvct_el0" : "=r" (t[0]));
++				for (int i = 0; i < 1000; i++) {
++					wr(gic + 0x200, 0);
++				}
++				__asm__ volatile ("isb; mrs %0, cntvct_el0" : "=r" (t[1]));
++				for (int i = 0; i < 1000; i++) {
++					wr(m + AS(1) + AS_TRANSTAB_LO, 0);
++				}
++				__asm__ volatile ("isb; mrs %0, cntvct_el0" : "=r" (t[2]));
++				for (int i = 0; i < 1000; i++) {
++					(void)rd(gic + 0x200);
++				}
++				__asm__ volatile ("isb; mrs %0, cntvct_el0" : "=r" (t[3]));
++				for (int i = 0; i < 1000; i++) {
++					(void)rd(m + AS(1) + AS_TRANSTAB_LO);
++				}
++				__asm__ volatile ("isb; mrs %0, cntvct_el0" : "=r" (t[4]));
++				say("mali: kernel, ticks of 26 MHz per 1000: GIC writes %llu, GPU writes %llu, GIC reads %llu, GPU reads %llu\n",
++				    t[1] - t[0], t[2] - t[1], t[3] - t[2], t[4] - t[3]);
++				show_mapping("the GIC distributor", gic);
++			}
++		}
++	}
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_FIRST, mali_early_write_test);
+diff --git a/bsd/dev/x1s_gpu_glue.c b/bsd/dev/x1s_gpu_glue.c
+new file mode 100644
+index 0000000..b43e0cb
+--- /dev/null
++++ b/bsd/dev/x1s_gpu_glue.c
+@@ -0,0 +1,86 @@
++/*
++ * x1s (iOS 27, UniXNU xnu-12377): what the HakiOS Mali-G77 driver (bsd/dev/hakios.mali.c and
++ * iokit/Kernel/hakios.gpu.cpp, copied from the S20's HakiOS tree) takes from the rest of HakiOS's kernel,
++ * which this kernel does not have.
++ *
++ * - The GPU's temperature comes from the heat guard (drivers/ArmCpu heatguard.inc), which already asks the
++ *   APM for every zone once a second: x1s_heat_zone[]. The GPU driver never talks to the APM's temperature
++ *   channel itself, so there is one writer on that queue.
++ * - Messages to the APM (DVFS) are refused (ENODEV) for now: the GPU stays at the clock it is given, and
++ *   its governor does nothing.
++ * - The Adreno half of the GPU service answers "no GPU": this phone has none.
++ * - The timeline log is off.
++ *
++ * None of this runs unless the kernel is booted with mali=N: hakios_mali_init() returns at once without it.
++ */
++#include <stdbool.h>
++#include <stdint.h>
++#include <sys/errno.h>
++#include <sys/systm.h>
++
++/* drivers/ArmCpu heatguard.inc: the last reading of each zone (0 BIG, 1 MID, 2 LITTLE, 3 G3D), -1 if none */
++extern volatile int32_t x1s_heat_zone[4];
++extern volatile uint32_t x1s_heat_reads;
++
++int hakios_exynos_temperature(uint32_t zone);
++int
++hakios_exynos_temperature(uint32_t zone)
++{
++	if (zone > 3 || x1s_heat_reads == 0) {
++		return -1;      /* no guard reading yet: no temperature, so the Mali driver will not power on */
++	}
++	return x1s_heat_zone[zone];
++}
++
++int hakios_exynos_acpm(uint32_t channel, uint32_t cmd[4]);
++int
++hakios_exynos_acpm(__unused uint32_t channel, __unused uint32_t cmd[4])
++{
++	return ENODEV;
++}
++
++void hakios_exynos_acpm_show(uint32_t channel);
++void
++hakios_exynos_acpm_show(__unused uint32_t channel)
++{
++}
++
++void hakios_exynos_acpm_list(void);
++void
++hakios_exynos_acpm_list(void)
++{
++}
++
++/* hakios.input.c: a touch makes the GPU governor raise the clock; nobody calls it here */
++void (*hakios_touch_boost)(void);
++
++/* the timeline log (hakios.input.c in HakiOS): off */
++void hakios_tl(const char *format, ...) __printflike(1, 2);
++void
++hakios_tl(__unused const char *format, ...)
++{
++}
++
++/* the Adreno half of the GPU service (hakios.adreno.c): there is no Adreno on this phone */
++uint32_t gpu_log;
++bool hakios_gpu_ready(void) { return false; }
++bool hakios_gpu_parameter(__unused uint32_t which, __unused uint64_t *value) { return false; }
++uint64_t hakios_gpu_address(__unused uint64_t size) { return 0; }
++void hakios_gpu_address_free(__unused uint64_t address, __unused uint64_t size) {}
++bool hakios_gpu_map(__unused uint64_t address, __unused uint64_t phys, __unused bool read_only) { return false; }
++void hakios_gpu_mapped(void) {}
++void hakios_gpu_unmap(__unused uint64_t address, __unused uint64_t size) {}
++void hakios_gpu_to_memory(__unused void *start, __unused uint64_t size) {}
++uint32_t hakios_gpu_submit(__unused const uint64_t *addresses, __unused const uint32_t *words, __unused uint32_t count) { return 0; }
++bool hakios_gpu_done(__unused uint32_t fence) { return true; }
++uint32_t hakios_gpu_last(void) { return 0; }
++void hakios_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
++{
++	*microseconds = 0;
++	*submissions = 0;
++	for (int i = 0; i < 7; i++) {
++		by[i] = 0;
++	}
++}
++void hakios_gpu_report(__unused const char *why) {}
++void hakios_gpu_stop(void) {}
+diff --git a/bsd/sys/hakios.input.h b/bsd/sys/hakios.input.h
+new file mode 100644
+index 0000000..88bbe5e
+--- /dev/null
++++ b/bsd/sys/hakios.input.h
+@@ -0,0 +1,134 @@
++/*
++ * /dev/hakios-touch: touch samples on their way from whoever produces them to the
++ * program that turns them into HID events for the window server.
++ *
++ * Darwin expects touches from Apple's multitouch driver through IOHIDFamily; neither exists
++ * here. Instead a producer -- a kernel driver for a real touch controller or for an emulated
++ * pointer, or a user program replaying a script -- posts samples, and code of ours running
++ * inside backboardd reads them and synthesizes the events. Both sides use the same record.
++ *
++ *   write(): one or more records (time is ignored; the kernel stamps them)
++ *   read():  blocks until there is at least one record, returns as many whole ones as fit
++ */
++#ifndef _SYS_HAKIOS_INPUT_H_
++#define _SYS_HAKIOS_INPUT_H_
++
++#include <stdint.h>
++
++#define HAKIOS_TOUCH_DEVICE    "/dev/hakios-touch"
++
++#define HAKIOS_TOUCH_DOWN      1       /* a finger has landed */
++#define HAKIOS_TOUCH_MOVE      2
++#define HAKIOS_TOUCH_UP        3       /* it has lifted (x, y: where it was last) */
++#define HAKIOS_BUTTON_DOWN     4       /* a hardware button; `finger` says which (HAKIOS_BUTTON_*), x and y are 0 */
++#define HAKIOS_BUTTON_UP       5
++
++#define HAKIOS_BUTTON_LOCK     1       /* the side button */
++#define HAKIOS_BUTTON_VOLUME_UP 2
++#define HAKIOS_BUTTON_VOLUME_DOWN 3
++#define HAKIOS_BUTTON_HOME     4
++
++struct hakios_touch {
++	uint64_t time;                  /* mach_absolute_time() when the sample was posted */
++	uint32_t type;                  /* HAKIOS_TOUCH_* or HAKIOS_BUTTON_DOWN/UP */
++	uint32_t finger;                /* which finger, from 0 (or which button) */
++	uint32_t x, y;                  /* position on the display, 0 = left/top edge, 65535 = right/bottom edge */
++};
++
++#ifdef KERNEL
++/* For drivers; not from interrupt context. */
++void hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
++void hakios_input_init(void);
++void hakios_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
++void hakios_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
++void hakios_sec_ts_init(void);         /* boot-arg sec_ts=1: the Galaxy S20's (x1s) touch screen */
++void hakios_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
++void hakios_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
++void hakios_ufs_report(const char *when); /* where reading the storage has spent its time so far */
++bool hakios_ufs_dev(dev_t dev);           /* one of the storage's devices */
++int hakios_ufs_read_partition(const char *name, uint64_t offset, uint8_t *dst, uint64_t len, uint64_t *bytes); /* for drivers */
++/* a file of one of the RAM disks (drivers/storage/hakios.image.c): fw/<name> is the firmware userland/build.sh put there */
++const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
++void hakios_battery_init(void);        /* boot-arg battery=1: Qualcomm UEFI charger state shared by xnuloader */
++int hakios_battery_temperature(void);  /* the battery's temperature in C, -273 while it is not known */
++/* one transfer at a time through the PMIC arbiter for this system (drivers/input/hakios.buttons.c) */
++void hakios_spmi_lock(void);
++void hakios_spmi_unlock(void);
++/*
++ * How the battery is, as the audio DSP's battery manager says (drivers/audio/hakios.adsp.c, with adsp=1):
++ * handed to drivers/power/hakios.battery.c, which keeps it for the sysctls kern.hakios.battery_* and
++ * passes it on to drivers/power/hakios.battery.cpp, the power source that Darwin reads. The structure
++ * is repeated there (this header is not seen from iokit/), and `size` tells whether the two agree.
++ */
++struct hakios_battery_state {
++	uint32_t size;                  /* sizeof(struct hakios_battery_state) */
++	int32_t percent_hundredths;     /* the charge, 0..10000 */
++	int32_t voltage_uv;
++	int32_t current_ua;             /* more than 0 while the battery takes charge */
++	int32_t temperature_hundredths; /* of a degree Celsius */
++	int32_t present;                /* 1 if there is a battery */
++	int32_t external;               /* 1 if a charger or a computer is on the USB port */
++	int32_t status;                 /* Linux's POWER_SUPPLY_STATUS_*: 1 charging, 2 discharging, 3 not charging, 4 full */
++	int32_t charge_uah, full_uah, design_uah, cycles;      /* 0 when not known (yet) */
++	int32_t usb_type;               /* Linux's POWER_SUPPLY_USB_TYPE_*: 1 a computer's port, 2 a charger, ... */
++	int32_t usb_voltage_uv, usb_current_ua;                 /* what the port gives */
++};
++void hakios_battery_report(const struct hakios_battery_state *state);
++void hakios_net_init(void);            /* en0, if there is something to carry its frames: sys/hakios.net.h */
++void hakios_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's processor at full speed */
++void hakios_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */
++void hakios_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
++void hakios_adreno_stop(void);         /* before that, where the ending is no panic's: the GPU given back in order */
++void hakios_adreno_minute(void);       /* once a minute: a line about how warm the GPU is, if it is in use */
++void hakios_mali_init(void);           /* boot-arg mali=N: the first N steps of waking the Galaxy S20's (Exynos990) Mali GPU */
++void hakios_mali_stop(void);           /* its cores off, if they were left on */
++int hakios_exynos_temperature(uint32_t zone); /* an Exynos990 APM temperature zone in degrees (3: the GPU), -1 if not known */
++int hakios_exynos_acpm(uint32_t channel, uint32_t cmd[4]); /* a message to the Exynos990's APM, its answer in cmd: 0 or an errno */
++void hakios_exynos_acpm_show(uint32_t channel);  /* an APM channel's description and queues, in the log (read only) */
++void hakios_exynos_acpm_list(void);              /* every APM channel of the firmware's table, in the log (read only) */
++void hakios_wifi_init(void);           /* boot-arg wifi=1: the phone's Wi-Fi; wifi_step=N: the first N steps of it */
++void hakios_adsp_init(void);           /* boot-arg adsp=1: the phone's audio DSP started and linked; adsp_step=N: the first N steps */
++void hakios_mpss_init(void);           /* boot-arg modem=1: the phone's modem started and linked; modem_step=N: the first N steps */
++void hakios_wifi_stop(void);           /* where a run ends in order: the Wi-Fi DSP, if it was started, shut down */
++int hakios_wifi_say(const char *format, ...) __printflike(1, 2);      /* a line of the Wi-Fi steps' log */
++int hakios_wifi_tell(const char *format, ...) __printflike(1, 2);     /* ... one that is said even with wifi=1 */
++uint32_t hakios_wifi_option(const char *name);                         /* a boot-arg's number, or what wifi=1 stands for */
++const uint8_t *hakios_wifi_file(const char *name, uint64_t *size);     /* a file of fw/ in the small image, in place */
++bool hakios_wlfw_exchange(uint32_t step);                              /* step 15 of wifi_step=N: hakios.wlfw.c */
++bool hakios_wlfw_registers(uint64_t *address, uint32_t *size, bool *mission); /* ... and what it learnt for step 16 */
++void hakios_wlfw_stop(uint32_t step);                                  /* ... and its end, before the DSP is stopped */
++void hakios_wifi_quiesce(void);        /* on the way back to the loader: the Wi-Fi DSP, if it still runs, shut down */
++/* ath11k's object and the kernel's side of it (drivers/wifi/hakios.lx.c), and what that asks of the phone's radio */
++int hakios_lx_start(void);             /* the driver brought up on the radio as far as it is built: 0 or an errno */
++void hakios_lx_stop(void);             /* ... and down again, if it stayed up (a network joined) */
++int hakios_lx_prepare(void);           /* before all that: the memory the radio will be shown, taken; 0 or an errno */
++void hakios_lx_net_early(void);        /* ... and en0 made on the radio now, if the kernel was given its address */
++bool hakios_wifi_dsp_is_up(void);      /* the DSP that runs the radio's firmware has been started and has a link */
++const uint8_t *hakios_wifi_driver_file(const char *name, uint64_t *size);     /* a file by the name Linux has for it */
++bool hakios_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *address); /* memory shown to the radio */
++bool hakios_wifi_radio_msi(unsigned long long *address, uint32_t *data, uint32_t *first_spi); /* where the radio raises its interrupts */
++bool hakios_wifi_radio_address(uint8_t *address);      /* the radio's own address (boot-arg wifi_mac), if one was given */
++/* the network to join (fw/network of the small image): name and passphrase, buffer sizes in and lengths out */
++bool hakios_wifi_network(uint8_t *name, unsigned *name_length, uint8_t *passphrase, unsigned *passphrase_length);
++
++/*
++ * The GPU kept on (boot-arg adreno_keep=1), for drivers/gpu/hakios.gpu.cpp: see "the GPU kept on"
++ * in drivers/gpu/hakios.adreno.c. One caller at a time.
++ */
++bool hakios_gpu_ready(void);
++bool hakios_gpu_parameter(uint32_t which, uint64_t *value);
++uint64_t hakios_gpu_address(uint64_t size);
++void hakios_gpu_address_free(uint64_t address, uint64_t size);
++bool hakios_gpu_map(uint64_t address, uint64_t phys, bool read_only);
++void hakios_gpu_mapped(void);
++void hakios_gpu_unmap(uint64_t address, uint64_t size);
++void hakios_gpu_to_memory(void *start, uint64_t size);
++uint32_t hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
++bool hakios_gpu_done(uint32_t fence);
++uint32_t hakios_gpu_last(void);
++void hakios_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]);
++void hakios_gpu_report(const char *why);
++void hakios_gpu_stop(void);
++#endif
++
++#endif /* _SYS_HAKIOS_INPUT_H_ */
+diff --git a/iokit/Kernel/hakios.gpu.cpp b/iokit/Kernel/hakios.gpu.cpp
+new file mode 100644
+index 0000000..b18cec4
+--- /dev/null
++++ b/iokit/Kernel/hakios.gpu.cpp
+@@ -0,0 +1,1619 @@
++/*
++ * HakiosGPU: the phone's Adreno for programs to draw with.
++ *
++ * drivers/gpu/hakios.adreno.c wakes the GPU and, with boot-arg adreno_keep=1, keeps it on and
++ * starts this service. A program that opens it speaks the interface of Linux's msm DRM driver,
++ * the one Mesa's freedreno knows: every request of that interface is a call of the user client
++ * with the request's number as the selector and the request's structure passed in and back
++ * (userland: tools/mesa/hakios-drm, which stands in for libdrm inside Mesa). What Linux does
++ * with mmap() on the device is the client memory of the type that is the buffer's handle.
++ *
++ * What there is of the interface is what freedreno uses to draw: parameters, buffers (made,
++ * told their address in the GPU's address space, mapped, given back), submission of command
++ * buffers, and waiting for one to be done. A buffer is wired kernel memory entered into the 3D
++ * core's SMMU context; it is zero when made, and write-combined: what the program writes goes to
++ * memory, where the GPU reads it, and not into this processor's cache (as Linux maps them for
++ * freedreno; boot-arg gpu_cached=1 makes them ordinary memory, pushed out of the cache whenever
++ * the GPU is given something to do: see submit()).
++ *
++ * One request is not Linux's: a buffer that is the memory of an IOSurface (surfaceBuffer()), for
++ * drawing into what the display shows and for reading pictures where other programs have drawn
++ * them. Linux hands such memory around as file descriptors; here it has a name already. That
++ * memory is ordinary, cached memory, which everybody else reads and writes as such.
++ *
++ * Not here yet: interrupts (waiting is asking again five times a millisecond), more than one
++ * program's worth of care (every client's buffers are in the one address space; a client that
++ * goes takes its own away), recovery of a GPU that has stopped answering (it is reported, see
++ * hakios_gpu_report(), and stays stopped), fences and buffers as file descriptors.
++ */
++
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOSubMemoryDescriptor.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <mach/vm_param.h>
++extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
++#include <sys/systm.h>
++
++#include "MiniIOSurface.h"
++
++extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
++
++extern "C" {
++/* drivers/gpu/hakios.adreno.c ("the GPU kept on"; declared in bsd/sys/hakios.input.h, which is not seen from here) */
++bool hakios_gpu_ready(void);
++bool hakios_gpu_parameter(uint32_t which, uint64_t * value);
++uint64_t hakios_gpu_address(uint64_t size);
++void hakios_gpu_address_free(uint64_t address, uint64_t size);
++bool hakios_gpu_map(uint64_t address, uint64_t phys, bool read_only);
++void hakios_gpu_mapped(void);
++void hakios_gpu_unmap(uint64_t address, uint64_t size);
++void hakios_gpu_to_memory(void * start, uint64_t size);
++uint32_t hakios_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
++extern uint32_t gpu_log;
++bool hakios_gpu_done(uint32_t fence);
++uint32_t hakios_gpu_last(void);
++void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
++void hakios_gpu_report(const char * why);
++void hakios_gpu_stop(void);
++
++void HakiosGPUStart(void);
++void HakiosGPUStop(void);
++void HakiosGPUStartMali(void);
++
++/* drivers/gpu/hakios.mali.c: the same functions for the Galaxy S20's Mali-G77 (Panfrost's interface, below) */
++bool hakios_mali_gpu_ready(void);
++bool hakios_mali_gpu_parameter(uint32_t which, uint64_t * value);
++uint64_t hakios_mali_gpu_address(uint64_t size);
++void hakios_mali_gpu_address_free(uint64_t address, uint64_t size);
++bool hakios_mali_gpu_map(uint64_t address, uint64_t phys, bool read_only);
++void hakios_mali_gpu_mapped(void);
++void hakios_mali_gpu_unmap(uint64_t address, uint64_t size);
++void hakios_mali_gpu_to_memory(void * start, uint64_t size);
++uint32_t hakios_mali_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
++bool hakios_mali_gpu_done(uint32_t fence);
++uint32_t hakios_mali_gpu_last(void);
++void hakios_mali_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
++void hakios_mali_gpu_report(const char * why);
++void hakios_mali_gpu_stop(void);
++void MiniIOMobileFramebufferShow(const uint8_t * pixels, uint32_t width, uint32_t height, uint32_t rowBytes);
++}
++
++/*
++ * Whose GPU this is. Everything below asks the GPU's driver through these: hakios.adreno.c's for redwood's Adreno
++ * (the msm interface), hakios.mali.c's for the Galaxy S20's Mali-G77 (the panfrost interface, panfrostRequest()).
++ */
++struct gpu_backend {
++	bool (*ready)(void);
++	bool (*parameter)(uint32_t which, uint64_t * value);
++	uint64_t (*address)(uint64_t size);
++	void (*address_free)(uint64_t address, uint64_t size);
++	bool (*map)(uint64_t address, uint64_t phys, bool read_only);
++	void (*mapped)(void);
++	void (*unmap)(uint64_t address, uint64_t size);
++	void (*to_memory)(void * start, uint64_t size);
++	uint32_t (*submit)(const uint64_t * addresses, const uint32_t * words, uint32_t count);
++	bool (*done)(uint32_t fence);
++	uint32_t (*last)(void);
++	void (*worked)(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
++	void (*report)(const char * why);
++	void (*stop)(void);
++};
++static const struct gpu_backend gAdreno = {
++	hakios_gpu_ready, hakios_gpu_parameter, hakios_gpu_address, hakios_gpu_address_free, hakios_gpu_map,
++	hakios_gpu_mapped, hakios_gpu_unmap, hakios_gpu_to_memory, hakios_gpu_submit, hakios_gpu_done, hakios_gpu_last,
++	hakios_gpu_worked, hakios_gpu_report, hakios_gpu_stop,
++};
++static const struct gpu_backend gMali = {
++	hakios_mali_gpu_ready, hakios_mali_gpu_parameter, hakios_mali_gpu_address, hakios_mali_gpu_address_free,
++	hakios_mali_gpu_map, hakios_mali_gpu_mapped, hakios_mali_gpu_unmap, hakios_mali_gpu_to_memory,
++	hakios_mali_gpu_submit, hakios_mali_gpu_done, hakios_mali_gpu_last, hakios_mali_gpu_worked,
++	hakios_mali_gpu_report, hakios_mali_gpu_stop,
++};
++static const struct gpu_backend * gb = &gAdreno;
++
++/* Linux's include/uapi/drm/panfrost_drm.h: the Mali's requests (DRM_COMMAND_BASE + n) and structures */
++enum {
++	kPanfrostSubmit         = 0x40,
++	kPanfrostWaitBo         = 0x41,
++	kPanfrostCreateBo       = 0x42,
++	kPanfrostMmapBo         = 0x43,
++	kPanfrostGetParam       = 0x44,
++	kPanfrostGetBoOffset    = 0x45,
++	kPanfrostMadvise        = 0x48,
++	kPanfrostSetLabelBo     = 0x49,
++};
++struct panfrost_submit {
++	uint64_t jc, in_syncs;
++	uint32_t in_sync_count, out_sync;               /* out_sync: the fence goes back here (tools/mesa/hakios-drm) */
++	uint64_t bo_handles;
++	uint32_t bo_handle_count, requirements;
++};
++struct panfrost_wait_bo {
++	uint32_t handle, pad;
++	int64_t timeout_ns;
++};
++struct panfrost_create_bo {
++	uint32_t size, flags, handle, pad;
++	uint64_t offset;
++};
++struct panfrost_mmap_bo {
++	uint32_t handle, flags;
++	uint64_t offset;
++};
++struct panfrost_get_param {
++	uint32_t param, pad;
++	uint64_t value;
++};
++struct panfrost_get_bo_offset {
++	uint32_t handle, pad;
++	uint64_t offset;
++};
++struct panfrost_madvise {
++	uint32_t handle, madv, retained;
++};
++
++/* Linux's include/uapi/drm/msm_drm.h and drm.h: the requests' numbers and structures. */
++enum {
++	kDrmGemClose            = 0x09,
++	kMsmGetParam            = 0x40,
++	kMsmSetParam            = 0x41,
++	kMsmGemNew              = 0x42,
++	kMsmGemInfo             = 0x43,
++	kMsmGemCpuPrep          = 0x44,
++	kMsmGemCpuFini          = 0x45,
++	kMsmGemSubmit           = 0x46,
++	kMsmWaitFence           = 0x47,
++	kMsmGemMadvise          = 0x48,
++	kMsmSubmitQueueNew      = 0x4a,
++	kMsmSubmitQueueClose    = 0x4b,
++	kMsmSubmitQueueQuery    = 0x4c,
++	kHakiosUserMemory      = 0x7d,         /* ours: pages of the caller's own as a buffer (Linux's userptr) */
++	kHakiosSurface         = 0x7e,         /* ours: an IOSurface's memory as a buffer */
++	kHakiosShow            = 0x7f,         /* ours: pixels of the caller's onto the panel, to see a test's result */
++};
++
++struct msm_timespec {
++	int64_t seconds, nanoseconds;           /* of the clock that goes on while the machine sleeps */
++};
++struct msm_param {
++	uint32_t pipe, param;
++	uint64_t value;
++	uint32_t len, pad;
++};
++struct msm_gem_new {
++	uint64_t size;
++	uint32_t flags, handle;
++};
++struct msm_gem_info {
++	uint32_t handle, info;
++	uint64_t value;
++	uint32_t len, pad;
++};
++struct msm_gem_cpu_prep {
++	uint32_t handle, op;
++	struct msm_timespec timeout;
++};
++struct msm_gem_submit_cmd {
++	uint32_t type, submit_idx, submit_offset, size, pad, nr_relocs;
++	uint64_t relocs;
++};
++struct msm_gem_submit_bo {
++	uint32_t flags, handle;
++	uint64_t presumed;
++};
++struct msm_gem_submit {
++	uint32_t flags, fence, nr_bos, nr_cmds;
++	uint64_t bos, cmds;
++	int32_t fence_fd;
++	uint32_t queueid;
++	uint64_t in_syncobjs, out_syncobjs;
++	uint32_t nr_in_syncobjs, nr_out_syncobjs, syncobj_stride, pad;
++};
++struct msm_wait_fence {
++	uint32_t fence, flags;
++	struct msm_timespec timeout;
++	uint32_t queueid;
++};
++struct msm_gem_madvise {
++	uint32_t handle, madv, retained;
++};
++struct msm_submitqueue {
++	uint32_t flags, prio, id;
++};
++struct msm_submitqueue_query {
++	uint64_t data;
++	uint32_t id, param, len, pad;
++};
++struct drm_gem_close {
++	uint32_t handle, pad;
++};
++struct hakios_user_memory {
++	uint64_t address, size;                 /* in the caller, in whole pages */
++	uint32_t handle;                        /* back: the buffer */
++	uint32_t flags;
++};
++struct hakios_surface {
++	uint32_t surface;                       /* the IOSurface's ID */
++	uint32_t handle;                        /* kHakiosDescribe: no buffer is wanted; else, back: the buffer, */
++	uint64_t size;                          /* how big it is, */
++	uint32_t offset, rowBytes;              /* where the pixels start in it and how long a row of them is, */
++	uint32_t width, height, pixelFormat, planes;    /* and what they are */
++};
++struct hakios_show {
++	uint64_t pixels;
++	uint32_t width, height, rowBytes, pad;
++};
++
++#define kHakiosDescribe        0xffffffffu
++
++#define MSM_INFO_GET_OFFSET     0
++#define MSM_INFO_GET_IOVA       1
++#define MSM_INFO_SET_NAME       2
++#define MSM_INFO_GET_FLAGS      5
++#define MSM_BO_GPU_READONLY     0x00000002
++#define MSM_PREP_NOSYNC         0x04
++#define MSM_SUBMIT_CMD_BUF      1
++#define MSM_SUBMIT_FENCE_FD_OUT 0x20000000
++
++#define GPU_BUFFERS             8192            /* a client's, at most */
++#define GPU_BUFFER_MAX          (256u << 20)
++#define GPU_SUBMIT_CMDS         128
++#define GPU_SUBMIT_BOS          8192
++#define GPU_PATIENCE_MS         5000            /* for a buffer or a submission that somebody waits for without a limit */
++#define GPU_ASK_AGAIN_US        200             /* while waiting for the core: how long between two looks at how far it is */
++#define GPU_ASK_AGAIN_MALI_US   50              /* ... the S20's Mali: a look is one load, one TLB entry emptied (hakios.mali.c) */
++#define GPU_PUSH_AGAIN_MS       4               /* a surface is pushed out of the cache again for a submission this long after the last */
++
++static IOLock * gGPULock;                       /* around everything that is the GPU's (hakios_gpu_...) */
++static bool gGPUReported;
++static bool gGPUCached;                         /* boot-arg gpu_cached=1 */
++
++/* What the last seconds' submissions were and cost here, for the log. */
++static struct {
++	uint64_t since, flushing, waiting, taking;      /* times of the processor's clock */
++	uint64_t flushed;                       /* bytes sent out of the cache */
++	uint32_t submissions, commands, buffers, surfaces, waits, over;
++	uint32_t made, given_again;             /* buffers of their own made for programs, and of those kept ones given again */
++	uint64_t making;                        /* ... and the time it took to make the others */
++} gGPUStat;
++
++/* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
++static bool
++gpuWait(uint32_t fence, uint64_t milliseconds)
++{
++	uint64_t began = mach_absolute_time(), patience;
++
++	nanoseconds_to_absolutetime(milliseconds * NSEC_PER_MSEC, &patience);
++	for (bool waited = false;; waited = true) {
++		if (gb->done(fence)) {
++			if (waited) {
++				gGPUStat.waits++;
++				gGPUStat.waiting += mach_absolute_time() - began;
++			}
++			return true;
++		}
++		if (mach_absolute_time() - began >= patience || gGPUReported) {
++			break;                  /* (a GPU that has stopped answering is not waited for again) */
++		}
++		IOLockUnlock(gGPULock);
++		delay_for_interval(gb == &gMali ? GPU_ASK_AGAIN_MALI_US : GPU_ASK_AGAIN_US, NSEC_PER_USEC);
++		IOLockLock(gGPULock);
++	}
++	if (milliseconds >= 1000 && !gGPUReported) {
++		gGPUReported = true;
++		gb->report("no answer");
++	}
++	return false;
++}
++
++bool
++MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)
++{
++	uint32_t fence = surface->drawn;
++	bool done = true;
++
++	if (fence != 0 && gGPULock != NULL) {
++		IOLockLock(gGPULock);
++		done = !gb->ready() || gpuWait(fence, milliseconds);
++		IOLockUnlock(gGPULock);
++	}
++	return done;
++}
++
++/*
++ * Boot-arg touch_lat=1: a line for every wait of a program's for the GPU that took a millisecond or
++ * more ("tl: f KIND US at US"), for telling apart what holds a frame up (tools/frames.py).
++ */
++static TUNABLE(uint32_t, gWaitLines, "touch_lat", 0);
++
++static void
++slowWait(const char * kind, uint64_t began)
++{
++	uint64_t now = mach_absolute_time(), ns, at;
++
++	if (!gWaitLines) {
++		return;
++	}
++	absolutetime_to_nanoseconds(now - began, &ns);
++	if (ns >= NSEC_PER_MSEC) {
++		absolutetime_to_nanoseconds(now, &at);
++		hakios_tl("tl: f %s %llu at %llu\n", kind, ns / 1000, at / 1000);
++	}
++}
++
++/* How long from now a time of msm's is, in milliseconds; 0: now or past. */
++static uint64_t
++millisecondsUntil(const struct msm_timespec * when)
++{
++	uint64_t now;
++	int64_t left, end;
++
++	absolutetime_to_nanoseconds(mach_continuous_time(), &now);
++	/* the seconds are the caller's: a number too big to be nanoseconds is a time far ahead (or far behind), not a wrapped one */
++	if (__builtin_mul_overflow(when->seconds, (int64_t) NSEC_PER_SEC, &end) || __builtin_add_overflow(end, when->nanoseconds, &end)) {
++		return when->seconds > 0 && when->nanoseconds >= 0 ? GPU_PATIENCE_MS : 0;
++	}
++	if (end <= 0) {
++		return 0;                       /* (the clock's reading is never negative: this is past) */
++	}
++	left = end - (int64_t) now;
++	if (left <= 0) {
++		return 0;
++	}
++	return (uint64_t) left / NSEC_PER_MSEC > GPU_PATIENCE_MS ? GPU_PATIENCE_MS : (uint64_t) left / NSEC_PER_MSEC;
++}
++
++/*
++ * A wait that was to end at a time that had passed when it was asked for, and the GPU was not
++ * done: whoever asked goes on as if it were (a picture is shown half drawn). That is what comes
++ * of a caller whose clock is not this one, so the first few are told.
++ */
++static void
++waitOver(const struct msm_timespec * when, uint32_t fence)
++{
++	static uint32_t told;
++	uint64_t now;
++
++	gGPUStat.over++;
++	if (told < 4) {
++		told++;
++		absolutetime_to_nanoseconds(mach_continuous_time(), &now);
++		IOLog("HakiosGPU: a wait for submission %u, which is not done, until %lld.%09lld s, asked for at %llu.%09llu s: "
++		    "over before it began\n", fence, when->seconds, when->nanoseconds, now / NSEC_PER_SEC, now % NSEC_PER_SEC);
++	}
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++class HakiosGPU : public IOService
++{
++	OSDeclareDefaultStructors(HakiosGPU);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(HakiosGPU, IOService);
++
++bool
++HakiosGPU::start(IOService * provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "HakiosGPUUserClient");
++	setName("HakiosGPU");
++	registerService();
++	return true;
++}
++
++void
++HakiosGPUStart(void)
++{
++	IOService * provider = IOService::getPlatform();
++	HakiosGPU * gpu;
++	uint32_t cached = 0;
++
++	gGPUCached = PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached)) && cached != 0;
++	gGPULock = IOLockAlloc();
++	gpu = OSTypeAlloc(HakiosGPU);
++	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
++		OSSafeReleaseNULL(gpu);
++		IOLog("HakiosGPU: cannot create the service\n");
++		return;
++	}
++	if (!gpu->start(provider)) {
++		gpu->detach(provider);
++		IOLog("HakiosGPU: the service did not start\n");
++	}
++	gpu->release();
++}
++
++/* hakios.mali.c, mali_keep=1: the service for the Galaxy S20's Mali-G77, speaking Panfrost's interface */
++void
++HakiosGPUStartMali(void)
++{
++	gb = &gMali;
++	HakiosGPUStart();
++}
++
++/* The run is ending (hakios.adreno.c): nobody is in the middle of anything when the GPU goes. */
++void
++HakiosGPUStop(void)
++{
++	IOLockLock(gGPULock);
++	gb->stop();
++	IOLockUnlock(gGPULock);
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++struct gpu_buffer {
++	IOMemoryDescriptor *            memory;         /* NULL: this handle is free */
++	uint8_t *                       kernel;         /* where it is in the kernel */
++	MiniIOSurface *                 surface;        /* whose memory it is, when not its own */
++	bool                            client;         /* the client's own pages (no kernel view: out of the cache by their physical addresses) */
++	uint64_t                        address;        /* the GPU's for it */
++	uint64_t                        size;
++	uint32_t                        flags;
++	uint32_t                        seed;           /* the surface's when it was last pushed out of the cache, */
++	uint64_t                        pushed;         /* ... and when that was */
++	bool                            seen;           /* by the program: mapped, and from then on written by it */
++	uint32_t                        fence;          /* the last submission that names it (0: none has) */
++};
++
++/*
++ * A buffer given back while the GPU is still at it: its memory and its place in the GPU's
++ * address space are kept until the submission is done, and nobody waits for that. (A window
++ * server that makes a surface for every frame gives the last frame's back while the GPU draws
++ * this one: waiting there, for all the GPU had been given, cost it some five milliseconds a
++ * frame.)
++ */
++struct gpu_left {
++	IOMemoryDescriptor *            memory;
++	MiniIOSurface *                 surface;
++	bool                            client;
++	uint64_t                        address, size;
++	uint32_t                        fence, flags;
++};
++#define GPU_LEFT                64
++
++/*
++ * A buffer of the program's own given back, and done with: kept, memory and place in the GPU's
++ * address space, for the next one of the same size and kind. CoreAnimation makes a new texture to
++ * draw a blur into for every frame of an animation with one (Search: 1082 x 1226, 6 MB with Mesa's
++ * rounding), and gives them back only later, a score at a time; Mesa keeps what is given back for
++ * a second and then lets it go. Each made afresh here took 2 to 3.5 ms of the window server's frame
++ * (memory got, cleared, made write-combined, and entered page by page into the GPU's address
++ * space). A buffer kept is given again as it is, not cleared: it was the same program's (Mesa's own
++ * cache gives buffers back the same way). At most GPU_KEPT_BYTES are kept (the one kept longest
++ * makes way), none for longer than GPU_KEPT_SECONDS. rc.jobs.fps, Search: 8 such textures made
++ * slowly instead of 77, the window server's frames drawn in 6.8 ms instead of 9.3-10 (median).
++ */
++struct gpu_kept {
++	IOMemoryDescriptor *            memory;         /* NULL: this place is free */
++	uint8_t *                       kernel;
++	uint64_t                        address, size, since;
++	uint32_t                        flags;
++};
++#define GPU_KEPT                48
++#define GPU_KEPT_BYTES          (160ull << 20)
++#define GPU_KEPT_SECONDS        60              /* a buffer not asked for again in so long is let go */
++#define GPU_KEEP_FROM           (256u << 10)    /* bytes: smaller ones are not worth it */
++static TUNABLE(uint32_t, gGPUKeep, "gpu_keep", 1);      /* boot-arg gpu_keep=0 (a test): none kept; gpu_keep=2: kept ones cleared when given again */
++
++class HakiosGPUUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(HakiosGPUUserClient);
++
++	task_t                  fTask;
++	struct gpu_buffer *     fBuffers;               /* handle n is fBuffers[n - 1] */
++	uint32_t                fNextQueue;
++	uint32_t                fNextBuffer;            /* where the search for a free handle starts: one given back is not the next given */
++	uint32_t                fBufferCount;
++	uint64_t                fBufferBytes;
++	uint32_t                fSubmits;
++	uint32_t                fStrangers;             /* requests that named a buffer the client does not have */
++	struct gpu_left         fLeft[GPU_LEFT];
++	uint32_t                fLeftCount;
++	struct gpu_kept         fKept[GPU_KEPT];
++	uint64_t                fKeptBytes;
++
++	struct gpu_buffer * buffer(uint32_t handle);
++	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle);
++	void freeBuffer(struct gpu_buffer * b);
++	bool keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags);
++	void dropKept(struct gpu_kept * k);
++	void reap(void);
++	IOReturn gemNew(struct msm_gem_new * request);
++	IOReturn surfaceBuffer(struct hakios_surface * request);
++	IOReturn userBuffer(struct hakios_user_memory * request);
++	IOReturn gemInfo(struct msm_gem_info * request);
++	IOReturn submit(struct msm_gem_submit * request);
++	IOReturn show(const struct hakios_show * request);
++	IOReturn panfrostRequest(uint32_t selector, void * request);
++	IOReturn trapSubmit(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
++	IOReturn trapWaitBo(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
++
++public:
++	virtual IOExternalTrap * getTargetAndTrapForIndex(IOService ** targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
++	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties) APPLE_KEXT_OVERRIDE;
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(HakiosGPUUserClient, IOUserClient);
++
++bool
++HakiosGPUUserClient::initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type, properties)) {
++		return false;
++	}
++	fTask = owningTask;
++	return true;
++}
++
++bool
++HakiosGPUUserClient::start(IOService * provider)
++{
++	if (!gb->ready() || !IOUserClient::start(provider)) {
++		return false;
++	}
++	fBuffers = IONewZero(struct gpu_buffer, GPU_BUFFERS);
++	return fBuffers != NULL;
++}
++
++/*
++ * With the lock held, and the GPU done with everything it has been given (`idle`). If it is
++ * not -- it has stopped answering -- the buffer's memory stays the GPU's for good: it may yet be
++ * written, and must not be somebody else's by then.
++ */
++void
++HakiosGPUUserClient::freeBuffer(struct gpu_buffer * slot)
++{
++	/*
++	 * gpuWait() below lets go of the lock: take the buffer out of its handle first and work on a copy, so that
++	 * a second close of the same handle (or the client's closing) cannot free the same memory and address twice.
++	 */
++	struct gpu_buffer saved = *slot;
++	struct gpu_buffer * b = &saved;
++
++	slot->memory = NULL;
++	slot->surface = NULL;
++	slot->client = false;
++	fBufferCount--;
++	fBufferBytes -= b->size;
++
++	bool busy = gb->ready() && b->fence != 0 && !gb->done(b->fence);
++
++	if (busy && fLeftCount == GPU_LEFT) {
++		busy = !gpuWait(b->fence, 1000);        /* (nowhere to keep it: this one is waited for) */
++	}
++	if (busy && fLeftCount < GPU_LEFT) {
++		struct gpu_left * left = &fLeft[fLeftCount++];
++
++		left->memory = b->memory;
++		left->surface = b->surface;
++		left->client = b->client;
++		left->address = b->address;
++		left->size = b->size;
++		left->fence = b->fence;
++		left->flags = b->flags;
++	} else {
++		if (busy) {
++			static uint32_t said;
++
++			if (b->surface == NULL) {
++				b->memory->retain();
++			} else {
++				b->surface->memory->retain();
++			}
++			if (said++ < 8) {
++				IOLog("HakiosGPU: the GPU is not done with what it was given: a buffer of %llu bytes stays its own\n", b->size);
++			}
++		} else if (b->surface == NULL && !b->client && gb->ready() &&
++		    keep(b->memory, b->kernel, b->address, b->size, b->flags)) {
++			b->memory = NULL;               /* (now the kept one's) */
++		} else if (gb->ready()) {
++			gb->unmap(b->address, b->size);
++			gb->address_free(b->address, b->size);
++		}
++		if (b->memory != NULL) {
++			b->memory->release();
++		}
++		if (b->surface != NULL) {
++			MiniIOSurfaceDrop(b->surface);
++		}
++	}
++}
++
++/* The buffers that were given back early and that the GPU is done with now: freed. With the lock held. */
++void
++HakiosGPUUserClient::reap(void)
++{
++	for (uint32_t i = 0; i < fLeftCount;) {
++		struct gpu_left * left = &fLeft[i];
++
++		if (gb->ready() && !gb->done(left->fence)) {
++			i++;
++			continue;
++		}
++		if (left->surface == NULL && !left->client && gb->ready() &&
++		    keep(left->memory, NULL, left->address, left->size, left->flags)) {
++			left->memory = NULL;
++		} else if (gb->ready()) {
++			gb->unmap(left->address, left->size);
++			gb->address_free(left->address, left->size);
++		}
++		if (left->memory != NULL) {
++			left->memory->release();
++		}
++		if (left->surface != NULL) {
++			MiniIOSurfaceDrop(left->surface);
++		}
++		*left = fLeft[--fLeftCount];
++	}
++}
++
++IOReturn
++HakiosGPUUserClient::clientClose(void)
++{
++	if (fBuffers != NULL) {
++		IOLockLock(gGPULock);
++		/* what the client had the GPU do last may still be going on, in these buffers */
++		if (gb->ready()) {
++			gpuWait(gb->last(), 1000);
++		}
++		for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
++			if (fBuffers[i].memory != NULL) {
++				freeBuffer(&fBuffers[i]);
++			}
++		}
++		reap();
++		for (uint32_t i = 0; i < GPU_KEPT; i++) {
++			dropKept(&fKept[i]);
++		}
++		if (fLeftCount != 0) {
++			IOLog("HakiosGPU: the GPU is not done with %u buffers of a program that is gone: they stay its own\n", fLeftCount);
++		}
++		IOLockUnlock(gGPULock);
++	}
++	if (!isInactive()) {
++		terminate();
++	}
++	return kIOReturnSuccess;
++}
++
++void
++HakiosGPUUserClient::free(void)
++{
++	if (fBuffers != NULL) {
++		IODelete(fBuffers, struct gpu_buffer, GPU_BUFFERS);
++		fBuffers = NULL;
++	}
++	IOUserClient::free();
++}
++
++struct gpu_buffer *
++HakiosGPUUserClient::buffer(uint32_t handle)
++{
++	if (handle == 0 || handle > GPU_BUFFERS || fBuffers[handle - 1].memory == NULL) {
++		/* (a program that names a buffer it has given back draws into somebody else's next: worth knowing) */
++		if (handle != 0 && fStrangers++ < 16) {
++			IOLog("HakiosGPU: buffer %u is asked for and is not there\n", handle);
++		}
++		return NULL;
++	}
++	return &fBuffers[handle - 1];
++}
++
++/*
++ * A handle and addresses of the GPU's for `size` bytes of a memory descriptor, from byte `from`
++ * of it on (wired memory; both in whole pages). With the lock held; NULL: there is no room.
++ */
++struct gpu_buffer *
++HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle)
++{
++	struct gpu_buffer * b = NULL;
++	bool mapped = true;
++
++	for (uint32_t n = 0; n < GPU_BUFFERS; n++) {
++		uint32_t i = (fNextBuffer + n) % GPU_BUFFERS;
++
++		if (fBuffers[i].memory == NULL) {
++			b = &fBuffers[i];
++			*handle = i + 1;
++			fNextBuffer = i + 1;
++			break;
++		}
++	}
++	if (b == NULL || (b->address = gb->address(size)) == 0) {
++		IOLog("HakiosGPU: no %s left for a buffer of %llu bytes\n", b ? "addresses" : "handles", size);
++		return NULL;
++	}
++	for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
++		IOByteCount length = 0;
++		addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
++
++		mapped = phys != 0 && gb->map(b->address + offset, phys, flags & MSM_BO_GPU_READONLY);
++	}
++	gb->mapped();
++	if (!mapped) {
++		gb->unmap(b->address, size);
++		gb->address_free(b->address, size);
++		IOLog("HakiosGPU: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
++		return NULL;
++	}
++	b->size = size;
++	b->flags = flags;
++	b->seed = 0;
++	b->pushed = 0;
++	b->seen = false;
++	b->fence = 0;
++	b->surface = NULL;
++	b->client = false;
++	fBufferCount++;
++	fBufferBytes += size;
++	return b;
++}
++
++/* With the lock held. */
++void
++HakiosGPUUserClient::dropKept(struct gpu_kept * k)
++{
++	if (k->memory == NULL) {
++		return;
++	}
++	if (gb->ready()) {
++		gb->unmap(k->address, k->size);
++		gb->address_free(k->address, k->size);
++	}
++	k->memory->release();
++	k->memory = NULL;
++	fKeptBytes -= k->size;
++}
++
++/* With the lock held, the GPU done with the buffer: kept if it is worth it (those kept longest make way). */
++bool
++HakiosGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags)
++{
++	struct gpu_kept * place = NULL;
++
++	if (gGPUKeep == 0 || size < GPU_KEEP_FROM || size > GPU_KEPT_BYTES / 4 || memory == NULL ||
++	    (kernel == NULL && OSDynamicCast(IOBufferMemoryDescriptor, memory) == NULL)) {
++		return false;
++	}
++	for (;;) {
++		struct gpu_kept * oldest = NULL;
++
++		place = NULL;
++		for (uint32_t i = 0; i < GPU_KEPT; i++) {
++			if (fKept[i].memory == NULL) {
++				place = place != NULL ? place : &fKept[i];
++			} else if (oldest == NULL || fKept[i].since < oldest->since) {
++				oldest = &fKept[i];
++			}
++		}
++		if (place != NULL && fKeptBytes + size <= GPU_KEPT_BYTES) {
++			break;
++		}
++		dropKept(oldest);
++	}
++	place->memory = memory;
++	place->kernel = kernel != NULL ? kernel : (uint8_t *) OSDynamicCast(IOBufferMemoryDescriptor, memory)->getBytesNoCopy();
++	place->address = address;
++	place->size = size;
++	place->flags = flags;
++	place->since = mach_absolute_time();
++	fKeptBytes += size;
++	return true;
++}
++
++IOReturn
++HakiosGPUUserClient::gemNew(struct msm_gem_new * request)
++{
++	uint64_t size = round_page_64(request->size), began = mach_absolute_time();
++	struct gpu_buffer * b;
++	IOBufferMemoryDescriptor * memory;
++
++	if (size == 0 || size > GPU_BUFFER_MAX) {
++		return kIOReturnBadArgument;
++	}
++	/* one kept of this size and kind, if there is one (the one kept last: likeliest still in the caches' way) */
++	IOLockLock(gGPULock);
++	struct gpu_kept * found = NULL;
++	uint64_t old;
++
++	nanoseconds_to_absolutetime(GPU_KEPT_SECONDS * NSEC_PER_SEC, &old);
++	for (uint32_t i = 0; i < GPU_KEPT; i++) {
++		struct gpu_kept * k = &fKept[i];
++
++		if (k->memory != NULL && began - k->since > old) {
++			dropKept(k);
++		}
++
++		if (k->memory != NULL && k->size == size && k->flags == request->flags && (found == NULL || k->since > found->since)) {
++			found = k;
++		}
++	}
++	for (uint32_t n = 0; found != NULL && n < GPU_BUFFERS; n++) {
++		uint32_t h = (fNextBuffer + n) % GPU_BUFFERS;
++
++		if (fBuffers[h].memory == NULL) {
++			b = &fBuffers[h];
++			bzero(b, sizeof(*b));
++			b->memory = found->memory;
++			b->kernel = found->kernel;
++			b->address = found->address;
++			b->size = found->size;
++			b->flags = found->flags;
++			fNextBuffer = h + 1;
++			fBufferCount++;
++			fBufferBytes += size;
++			request->handle = h + 1;
++			found->memory = NULL;
++			fKeptBytes -= size;
++			gGPUStat.given_again++;
++			IOLockUnlock(gGPULock);
++			if (gGPUKeep == 2) {
++				bzero(b->kernel, (size_t) b->size);
++			}
++			return kIOReturnSuccess;
++		}
++	}
++	IOLockUnlock(gGPULock);
++	/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
++	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
++	    (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, PAGE_SIZE);
++	if (memory == NULL) {
++		IOLog("HakiosGPU: no memory for a buffer of %llu bytes (%u buffers, %llu MB with this client)\n", size, fBufferCount,
++		    fBufferBytes >> 20);
++		return kIOReturnNoMemory;
++	}
++	if (gGPUCached) {
++		gb->to_memory(memory->getBytesNoCopy(), size);
++	}
++
++	IOLockLock(gGPULock);
++	b = newBuffer(memory, 0, size, request->flags, &request->handle);
++	if (b != NULL) {
++		b->memory = memory;
++		b->kernel = (uint8_t *) memory->getBytesNoCopy();
++		gGPUStat.made++;
++		gGPUStat.making += mach_absolute_time() - began;
++	}
++	IOLockUnlock(gGPULock);
++	if (b == NULL) {
++		memory->release();
++		return kIOReturnNoMemory;
++	}
++	return kIOReturnSuccess;
++}
++
++/*
++ * The memory of an IOSurface as a buffer: its pixels, from the page after the surface's shared
++ * state on (MiniIOSurface.h). The surface is held for as long as the buffer is there. A surface
++ * that is a buffer of this client's already is that buffer again, as with Linux's handles: so
++ * the client must not be giving that buffer back at the same moment (freedreno asks under the
++ * lock it gives buffers back under). Asked only to describe (kHakiosDescribe), no buffer is made.
++ */
++IOReturn
++HakiosGPUUserClient::surfaceBuffer(struct hakios_surface * request)
++{
++	MiniIOSurface * s = MiniIOSurfaceCopy(request->surface);
++	struct gpu_buffer * b = NULL;
++	IOMemoryDescriptor * memory;
++	uint64_t size, began = mach_absolute_time();
++
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	if (s->client != NULL) {
++		/* (memory of a program's own with a surface made around it: not in whole pages, and seldom in rows the GPU takes) */
++		MiniIOSurfaceDrop(s);
++		return kIOReturnUnsupported;
++	}
++	size = round_page_64(s->info.allocSize);
++	memory = IOSubMemoryDescriptor::withSubRange(s->memory, PAGE_SIZE, size, kIODirectionInOut);
++	if (memory == NULL || size == 0 || size > GPU_BUFFER_MAX) {
++		OSSafeReleaseNULL(memory);
++		MiniIOSurfaceDrop(s);
++		return kIOReturnNoMemory;
++	}
++	request->size = size;
++	request->offset = s->info.offset;
++	request->rowBytes = s->info.bytesPerRow;
++	request->width = s->info.width;
++	request->height = s->info.height;
++	request->pixelFormat = s->info.pixelFormat;
++	request->planes = s->info.planeCount;
++	if (request->handle == kHakiosDescribe) {
++		request->handle = 0;
++		memory->release();
++		MiniIOSurfaceDrop(s);
++		return kIOReturnSuccess;
++	}
++
++	IOLockLock(gGPULock);
++	for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
++		if (fBuffers[i].memory != NULL && fBuffers[i].surface == s) {
++			b = &fBuffers[i];
++			request->handle = i + 1;
++			break;
++		}
++	}
++	if (b != NULL) {
++		memory->release();
++		MiniIOSurfaceDrop(s);
++	} else if ((b = newBuffer(s->memory, PAGE_SIZE, size, 0, &request->handle)) != NULL) {
++		b->memory = memory;
++		b->kernel = s->kbase + PAGE_SIZE;
++		b->surface = s;
++		gGPUStat.surfaces++;
++	}
++	gGPUStat.taking += mach_absolute_time() - began;
++	IOLockUnlock(gGPULock);
++	if (b == NULL) {
++		memory->release();
++		MiniIOSurfaceDrop(s);
++		return kIOReturnNoMemory;
++	}
++	return kIOReturnSuccess;
++}
++
++/*
++ * Pages of the client's own as a buffer, as Linux's userptr: wired for as long as the buffer is there,
++ * entered into the GPU's address space, and seen by the kernel through a mapping of its own (for the
++ * cache: they are ordinary memory, pushed out of this processor's cache at every submission that
++ * names them). Vulkan's VK_EXT_external_memory_host over it (Turnip, tools/mesa/hakios-drm): Metal's
++ * no-copy buffers, CoreAnimation's backing stores.
++ */
++IOReturn
++HakiosGPUUserClient::userBuffer(struct hakios_user_memory * request)
++{
++	IOMemoryDescriptor * memory = NULL;
++	struct gpu_buffer * b;
++	uint64_t began = mach_absolute_time();
++
++	if ((request->address & PAGE_MASK) || (request->size & PAGE_MASK) || request->size == 0 ||
++	    request->size > GPU_BUFFER_MAX) {
++		static uint32_t said;
++
++		if (said++ < 8) {
++			IOLog("HakiosGPU: pages at %#llx (%llu bytes) of the client's: not whole pages of %u bytes\n",
++			    request->address, request->size, (unsigned) PAGE_SIZE);
++		}
++		return kIOReturnBadArgument;
++	}
++	/* pages the client may only read (a window server's view of another program's backing store): the GPU reads them only */
++	IOReturn prepared = kIOReturnNoMemory;
++	for (int pass = 0; pass < 2 && prepared != kIOReturnSuccess; pass++) {
++		memory = IOMemoryDescriptor::withAddressRange(request->address, request->size,
++		    pass == 0 ? kIODirectionInOut : kIODirectionOut, fTask);
++		if (memory == NULL) {
++			IOLog("HakiosGPU: pages at %#llx (%llu bytes) of the client's: no descriptor\n", request->address, request->size);
++			return kIOReturnNoMemory;
++		}
++		prepared = memory->prepare();
++		if (prepared != kIOReturnSuccess) {
++			memory->release();
++			memory = NULL;
++		} else if (pass == 1) {
++			request->flags |= MSM_BO_GPU_READONLY;
++		}
++	}
++	if (memory == NULL) {
++		static uint32_t said;
++
++		if (said++ < 8) {
++			IOLog("HakiosGPU: pages at %#llx (%llu bytes) of the client's cannot be wired: %#x\n",
++			    request->address, request->size, prepared);
++		}
++		return kIOReturnVMError;
++	}
++	IOLockLock(gGPULock);
++	b = newBuffer(memory, 0, request->size, request->flags, &request->handle);
++	if (b != NULL) {
++		b->memory = memory;             /* (its pages unwired as it goes: IOGeneralMemoryDescriptor::free) */
++		b->kernel = NULL;
++		b->client = true;
++		b->seen = true;
++		gGPUStat.surfaces++;
++	}
++	gGPUStat.taking += mach_absolute_time() - began;
++	IOLockUnlock(gGPULock);
++	if (b == NULL) {
++		static uint32_t said;
++
++		if (said++ < 8) {
++			IOLog("HakiosGPU: pages at %#llx (%llu bytes) of the client's: no room for them in the GPU\n",
++			    request->address, request->size);
++		}
++		memory->complete();
++		memory->release();
++		return kIOReturnNoMemory;
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++HakiosGPUUserClient::gemInfo(struct msm_gem_info * request)
++{
++	struct gpu_buffer * b;
++	IOReturn ret = kIOReturnSuccess;
++
++	IOLockLock(gGPULock);
++	b = buffer(request->handle);
++	if (b == NULL) {
++		ret = kIOReturnBadArgument;
++	} else if (request->info == MSM_INFO_GET_OFFSET) {
++		request->value = (uint64_t) request->handle << 32;      /* nobody maps by it here */
++	} else if (request->info == MSM_INFO_GET_IOVA) {
++		request->value = b->address;
++	} else if (request->info == MSM_INFO_GET_FLAGS) {
++		request->value = b->flags;
++	} else if (request->info != MSM_INFO_SET_NAME) {            /* a name for somebody's debugger: not kept */
++		ret = kIOReturnUnsupported;
++	}
++	IOLockUnlock(gGPULock);
++	return ret;
++}
++
++IOReturn
++HakiosGPUUserClient::submit(struct msm_gem_submit * request)
++{
++	struct msm_gem_submit_bo * bos = NULL;
++	struct msm_gem_submit_cmd * cmds = NULL;
++	uint64_t addresses[GPU_SUBMIT_CMDS];
++	uint32_t words[GPU_SUBMIT_CMDS], count = 0;
++	uint64_t began, nanos, again;
++	IOReturn ret = kIOReturnBadArgument;
++
++	if (request->nr_cmds == 0 || request->nr_cmds > GPU_SUBMIT_CMDS || request->nr_bos == 0 || request->nr_bos > GPU_SUBMIT_BOS) {
++		IOLog("HakiosGPU: a submission of %u command buffers in %u buffers: not taken\n", request->nr_cmds, request->nr_bos);
++		return kIOReturnBadArgument;
++	}
++	bos = IONew(struct msm_gem_submit_bo, request->nr_bos);
++	cmds = IONew(struct msm_gem_submit_cmd, request->nr_cmds);
++	if (bos == NULL || cmds == NULL) {
++		ret = kIOReturnNoMemory;
++		goto out;
++	}
++	if (copyin((user_addr_t) request->bos, bos, request->nr_bos * sizeof(*bos)) != 0 ||
++	    copyin((user_addr_t) request->cmds, cmds, request->nr_cmds * sizeof(*cmds)) != 0) {
++		ret = kIOReturnVMError;
++		goto out;
++	}
++	IOLockLock(gGPULock);
++	/*
++	 * The GPU reads memory and writes memory. What this processor's cache holds of an IOSurface
++	 * (somebody has written it, or has read it, as the display's driver does, and the GPU is to
++	 * draw into it again) goes out of the cache now: when the surface is said to have changed
++	 * (its seed: who writes one is to lock it, and so does a program that has had the GPU draw
++	 * into one: userland/src/eagl.c), and in any case once in a few milliseconds, which is once
++	 * a frame and not once a submission: not everybody who draws into a surface says so (an
++	 * application drawing a picture that is on the screen meanwhile). A surface this program
++	 * has mapped, every time. The buffers made here need none of that, unless they are
++	 * ordinary memory (gpu_cached=1).
++	 */
++	began = mach_absolute_time();
++	nanoseconds_to_absolutetime(GPU_PUSH_AGAIN_MS * NSEC_PER_MSEC, &again);
++	for (uint32_t i = 0; i < request->nr_bos; i++) {
++		struct gpu_buffer * b = buffer(bos[i].handle);
++
++		if (b == NULL) {
++			continue;
++		}
++		if (b->surface != NULL) {
++			uint32_t seed = b->surface->shared()->seed;
++
++			if (seed == b->seed && !b->seen && began - b->pushed < again) {
++				continue;
++			}
++			b->seed = seed;
++			b->pushed = began;
++		} else if (b->client) {
++			/* the client's own pages are ordinary memory: out of the cache every time, by their physical addresses */
++			for (uint64_t offset = 0; offset < b->size;) {
++				IOByteCount length = 0;
++				addr64_t phys = b->memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
++
++				if (phys == 0 || length == 0) {
++					break;
++				}
++				length = MIN(length, b->size - offset);
++				flush_dcache64(phys, (unsigned) length, TRUE);
++				offset += length;
++			}
++			gGPUStat.flushed += b->size;
++			continue;
++		} else if (!b->seen || !gGPUCached) {
++			continue;
++		}
++		gb->to_memory(b->kernel, b->size);
++		gGPUStat.flushed += b->size;
++	}
++	gb->to_memory(NULL, 0);                 /* (and what was written last is in memory: a barrier) */
++	gGPUStat.flushing += mach_absolute_time() - began;
++	gGPUStat.buffers += request->nr_bos;
++	for (uint32_t i = 0; i < request->nr_cmds; i++) {
++		struct gpu_buffer * b = cmds[i].submit_idx < request->nr_bos ? buffer(bos[cmds[i].submit_idx].handle) : NULL;
++
++		if (cmds[i].type != MSM_SUBMIT_CMD_BUF) {
++			continue;                               /* the other kinds are for a GPU shared between address spaces */
++		}
++		if (b == NULL || cmds[i].nr_relocs != 0 || (cmds[i].size & 3) || (cmds[i].submit_offset & 3) ||
++		    (uint64_t) cmds[i].submit_offset + cmds[i].size > b->size) {
++			IOLog("HakiosGPU: command buffer %u of a submission: buffer %u, offset %u, %u bytes, %u relocations: not taken\n",
++			    i, cmds[i].submit_idx, cmds[i].submit_offset, cmds[i].size, cmds[i].nr_relocs);
++			IOLockUnlock(gGPULock);
++			goto out;
++		}
++		addresses[count] = b->address + cmds[i].submit_offset;
++		words[count++] = cmds[i].size / 4;
++	}
++	request->fence = gb->submit(addresses, words, count);
++	if (gpu_log && request->fence != 0) {
++		/* "tl: Q FENCE at US: N buffers, B of 4 MB or more, W words of commands": what was given (tl: q: what it took) */
++		uint32_t big = 0, all_words = 0;
++		uint64_t ns;
++
++		for (uint32_t i = 0; i < request->nr_bos; i++) {
++			struct gpu_buffer * b = buffer(bos[i].handle);
++
++			big += b != NULL && b->size >= (4u << 20);
++		}
++		for (uint32_t i = 0; i < count; i++) {
++			all_words += words[i];
++		}
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++		hakios_tl("tl: Q %u at %llu: %u buffers, %u big, %u words\n", request->fence, ns / 1000, request->nr_bos, big, all_words);
++	}
++	if (request->flags & MSM_SUBMIT_FENCE_FD_OUT) {
++		request->fence_fd = -1;
++	}
++	/*
++	 * The surfaces named are being drawn into, or read, until this submission is done: the
++	 * display's driver waits for that before it puts one on the panel (MiniIOSurfaceDrawn()).
++	 * (freedreno names every buffer for reading and writing alike, so which it is cannot be
++	 * told; the last submission of a frame names the surface the frame is drawn into.)
++	 */
++	for (uint32_t i = 0; request->fence != 0 && i < request->nr_bos; i++) {
++		struct gpu_buffer * b = buffer(bos[i].handle);
++
++		if (b != NULL) {
++			b->fence = request->fence;
++			if (b->surface != NULL) {
++				b->surface->drawn = request->fence;
++			}
++		}
++	}
++	reap();
++	if (request->fence == 0 && !gGPUReported) {
++		gGPUReported = true;
++		gb->report("the ring is full");
++	}
++	if (fSubmits++ < 4) {
++		/* (addresses and words are only set up to `count`: with no command buffer among the commands, the first would be stack garbage) */
++		IOLog("HakiosGPU: submission %u: %u command buffers, the first at %#llx, %u words\n", request->fence, count,
++		    count != 0 ? addresses[0] : 0ull, count != 0 ? words[0] : 0u);
++	}
++	/* every five seconds in which something was submitted: how much, and what it cost here */
++	gGPUStat.submissions++;
++	gGPUStat.commands += count;
++	if (gGPUStat.since == 0) {
++		gGPUStat.since = began;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - gGPUStat.since, &nanos);
++	if (nanos >= 5 * NSEC_PER_SEC) {
++		uint64_t flushing, waiting, taking, worked;
++		uint32_t timed, by[7];
++
++		absolutetime_to_nanoseconds(gGPUStat.flushing, &flushing);
++		absolutetime_to_nanoseconds(gGPUStat.waiting, &waiting);
++		absolutetime_to_nanoseconds(gGPUStat.taking, &taking);
++		gb->worked(&worked, &timed, by);
++		uint64_t making;
++
++		absolutetime_to_nanoseconds(gGPUStat.making, &making);
++		IOLog("HakiosGPU: buffers: %u made in %llu us each, %u kept ones given again (%llu MB kept)\n", gGPUStat.made,
++		    gGPUStat.made ? making / NSEC_PER_USEC / gGPUStat.made : 0, gGPUStat.given_again, fKeptBytes >> 20);
++		IOLog("HakiosGPU: %u submissions in %llu ms: %u command buffers and %u buffers named, %llu KB out of the cache "
++		    "in %llu us a submission; the GPU worked %llu us on each of %u (%u under 0.1 ms, %u under 0.25, %u under 0.5, "
++		    "%u under 1, %u under 2, %u under 4, %u longer; %llu ms in all); %u waits of %llu us, %u over before they "
++		    "began; %u IOSurfaces taken as buffers in %llu us each; %u buffers, %llu MB\n",
++		    gGPUStat.submissions, nanos / NSEC_PER_MSEC, gGPUStat.commands, gGPUStat.buffers,
++		    (gGPUStat.flushed >> 10) / gGPUStat.submissions, flushing / NSEC_PER_USEC / gGPUStat.submissions,
++		    timed ? worked / timed : 0, timed, by[0], by[1], by[2], by[3], by[4], by[5], by[6], worked / 1000,
++		    gGPUStat.waits, gGPUStat.waits ? waiting / NSEC_PER_USEC / gGPUStat.waits : 0, gGPUStat.over,
++		    gGPUStat.surfaces, gGPUStat.surfaces ? taking / NSEC_PER_USEC / gGPUStat.surfaces : 0, fBufferCount,
++		    fBufferBytes >> 20);
++		bzero(&gGPUStat, sizeof(gGPUStat));
++	}
++	IOLockUnlock(gGPULock);
++	ret = request->fence != 0 ? kIOReturnSuccess : kIOReturnTimeout;
++out:
++	if (bos != NULL) {
++		IODelete(bos, struct msm_gem_submit_bo, request->nr_bos);
++	}
++	if (cmds != NULL) {
++		IODelete(cmds, struct msm_gem_submit_cmd, request->nr_cmds);
++	}
++	return ret;
++}
++
++/* Pixels of the caller's (32 bits each, blue first) copied to the panel: for a test to show what it has drawn. */
++IOReturn
++HakiosGPUUserClient::show(const struct hakios_show * request)
++{
++	uint64_t size = (uint64_t) request->rowBytes * request->height;
++	uint8_t * pixels;
++	IOReturn ret = kIOReturnSuccess;
++
++	if (request->width == 0 || request->width > 4096 || request->height == 0 || request->height > 4096 ||
++	    request->rowBytes < 4 * request->width) {
++		return kIOReturnBadArgument;
++	}
++	/* rowBytes is the caller's own number: without a limit it asks for terabytes of wired memory (no more than a buffer may be) */
++	if (size > GPU_BUFFER_MAX) {
++		return kIOReturnBadArgument;
++	}
++	pixels = (uint8_t *) IOMallocData(size);
++	if (pixels == NULL) {
++		return kIOReturnNoMemory;
++	}
++	if (copyin((user_addr_t) request->pixels, pixels, size) != 0) {
++		ret = kIOReturnVMError;
++	} else {
++		MiniIOMobileFramebufferShow(pixels, request->width, request->height, request->rowBytes);
++	}
++	IOFreeData(pixels, size);
++	return ret;
++}
++
++IOReturn
++HakiosGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory)
++{
++	struct gpu_buffer * b;
++	IOReturn ret = kIOReturnBadArgument;
++
++	IOLockLock(gGPULock);
++	b = buffer(type);
++	if (b != NULL) {
++		b->memory->retain();
++		b->seen = true;
++		*memory = b->memory;
++		*options = 0;
++		ret = kIOReturnSuccess;
++	}
++	IOLockUnlock(gGPULock);
++	return ret;
++}
++
++/*
++ * Panfrost's requests (the Galaxy S20's Mali, gb == &gMali), on the buffers above: a buffer is wired memory entered
++ * into the GPU's address space 0, executable unless the program says otherwise (the GPU runs its shaders from them).
++ * A submission is the GPU address of a job chain; its fence goes back in out_sync, and every buffer of this client
++ * waits for it (the bo_handles list is not read: all of them are the GPU's). What Panfrost waits for before
++ * submitting, tools/mesa/hakios-drm waits for in the program. With the lock not held.
++ */
++IOReturn
++HakiosGPUUserClient::panfrostRequest(uint32_t selector, void * request)
++{
++	IOReturn ret = kIOReturnSuccess;
++	struct gpu_buffer * b;
++
++	switch (selector) {
++	case kPanfrostSubmit: {
++		struct panfrost_submit * r = (struct panfrost_submit *) request;
++		uint64_t jc = r->jc;
++		uint32_t req = r->requirements, fence;
++
++		IOLockLock(gGPULock);
++		gb->to_memory(NULL, 0);                         /* (a barrier: what the program wrote is in memory) */
++		fence = gb->submit(&jc, &req, 1);
++		if (fence == 0) {
++			IOLockUnlock(gGPULock);
++			return kIOReturnBusy;
++		}
++		/*
++		 * (every buffer of the program's: Panfrost's jobs name their buffers inside the job chain, not in the request;
++		 * a surface among them is what the display's driver waits for before it shows it, MiniIOSurfaceDrawn(), and
++		 * the panel-sized one the GPU stretches a frame into is only shown once a submission has named it at all)
++		 */
++		/*
++		 * Only the buffers the job names (bo_handles), when it names them: marking every buffer of the program busy
++		 * made Panfrost's cache of freed buffers find none idle, so every render pass's scratch memory was made anew
++		 * and freed (run 104's glprof: a quarter of the drawing thread in buffer making, mapping and freeing).
++		 */
++		uint32_t named = r->bo_handle_count;
++		uint32_t * handles = named != 0 && named <= GPU_BUFFERS ? IONew(uint32_t, named) : NULL;
++
++		if (handles != NULL && copyin((user_addr_t) r->bo_handles, handles, named * sizeof(uint32_t)) == 0) {
++			for (uint32_t i = 0; i < named; i++) {
++				if ((b = buffer(handles[i])) != NULL) {
++					b->fence = fence;
++					if (b->surface != NULL) {
++						b->surface->drawn = fence;
++					}
++				}
++			}
++		} else {
++			for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
++				if (fBuffers[i].memory != NULL) {
++					fBuffers[i].fence = fence;
++					if (fBuffers[i].surface != NULL) {
++						fBuffers[i].surface->drawn = fence;
++					}
++				}
++			}
++		}
++		if (handles != NULL) {
++			IODelete(handles, uint32_t, named);
++		}
++		IOLockUnlock(gGPULock);
++		r->out_sync = fence;
++		break;
++	}
++	case kPanfrostWaitBo: {
++		struct panfrost_wait_bo * r = (struct panfrost_wait_bo *) request;
++		uint32_t fence;
++
++		IOLockLock(gGPULock);
++		b = buffer(r->handle);
++		fence = b != NULL && b->fence != 0 ? b->fence : gb->last();
++		if (!gpuWait(fence, r->timeout_ns != 0 ? 2000 : 0)) {
++			ret = kIOReturnTimeout;
++		}
++		IOLockUnlock(gGPULock);
++		break;
++	}
++	case kPanfrostCreateBo: {
++		struct panfrost_create_bo * r = (struct panfrost_create_bo *) request;
++		struct msm_gem_new made;
++
++		bzero(&made, sizeof(made));
++		made.size = r->size;
++
++		ret = gemNew(&made);
++		if (ret == kIOReturnSuccess) {
++			IOLockLock(gGPULock);
++			b = buffer(made.handle);
++			r->handle = made.handle;
++			r->offset = b != NULL ? b->address : 0;
++			IOLockUnlock(gGPULock);
++		}
++		break;
++	}
++	case kPanfrostMmapBo:
++		((struct panfrost_mmap_bo *) request)->offset = 0;     /* (mapped as client memory of type = handle) */
++		break;
++	case kPanfrostGetParam: {
++		struct panfrost_get_param * r = (struct panfrost_get_param *) request;
++
++		ret = gb->parameter(r->param, &r->value) ? kIOReturnSuccess : kIOReturnBadArgument;
++		break;
++	}
++	case kPanfrostGetBoOffset: {
++		struct panfrost_get_bo_offset * r = (struct panfrost_get_bo_offset *) request;
++
++		IOLockLock(gGPULock);
++		b = buffer(r->handle);
++		r->offset = b != NULL ? b->address : 0;
++		ret = b != NULL ? kIOReturnSuccess : kIOReturnBadArgument;
++		IOLockUnlock(gGPULock);
++		break;
++	}
++	case kPanfrostMadvise:
++		((struct panfrost_madvise *) request)->retained = 1;
++		break;
++	case kPanfrostSetLabelBo:
++		break;
++	default:
++		IOLog("HakiosGPU: Panfrost's request %#x is not known here\n", selector);
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	return ret;
++}
++
++/*
++ * Panfrost's SUBMIT and WAIT_BO by IOConnectTrap (the S20's Mali): an IOKit trap goes straight to the method, without
++ * IOConnectCallStructMethod's Mach message and its copies -- after runs 104-107 those two calls were about a fifth of
++ * the window server's drawing thread (glprof). The Galaxy S9+ port does the same (danstronics/ios-s9plus-exynos,
++ * hakios.mali_fast.h). Trap 0: SUBMIT, p1 the user's 40-byte drm_panfrost_submit (its out_sync written back); trap 1:
++ * WAIT_BO, p1 its 16 bytes. tools/mesa/hakios-drm/hakios.drm.c uses them when the first answers.
++ */
++IOExternalTrap *
++HakiosGPUUserClient::getTargetAndTrapForIndex(IOService ** targetP, UInt32 index)
++{
++	static IOExternalTrap traps[2] = {
++		{ NULL, (IOTrap) &HakiosGPUUserClient::trapSubmit },
++		{ NULL, (IOTrap) &HakiosGPUUserClient::trapWaitBo },
++	};
++
++	if (index >= 2 || gb != &gMali) {
++		return NULL;
++	}
++	*targetP = this;
++	return &traps[index];
++}
++
++IOReturn
++HakiosGPUUserClient::trapSubmit(void * p1, void *, void *, void *, void *, void *)
++{
++	struct panfrost_submit request;
++	IOReturn ret;
++
++	if (copyin((user_addr_t) p1, &request, sizeof(request)) != 0) {
++		return kIOReturnBadArgument;
++	}
++	ret = panfrostRequest(kPanfrostSubmit, &request);
++	if (ret == kIOReturnSuccess && copyout(&request, (user_addr_t) p1, sizeof(request)) != 0) {
++		return kIOReturnBadArgument;
++	}
++	return ret;
++}
++
++IOReturn
++HakiosGPUUserClient::trapWaitBo(void * p1, void *, void *, void *, void *, void *)
++{
++	struct panfrost_wait_bo request;
++
++	if (copyin((user_addr_t) p1, &request, sizeof(request)) != 0) {
++		return kIOReturnBadArgument;
++	}
++	return panfrostRequest(kPanfrostWaitBo, &request);
++}
++
++IOReturn
++HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
++{
++	union {
++		struct msm_param param;
++		struct msm_gem_new gemNew;
++		struct msm_gem_info gemInfo;
++		struct msm_gem_cpu_prep cpuPrep;
++		struct msm_gem_submit submit;
++		struct msm_wait_fence waitFence;
++		struct msm_gem_madvise madvise;
++		struct msm_submitqueue queue;
++		struct msm_submitqueue_query query;
++		struct drm_gem_close close;
++		struct hakios_surface surface;
++		struct hakios_user_memory user;
++		struct hakios_show show;
++		uint8_t panfrost[64];
++	} r;
++	size_t size = args->structureInputSize;
++	struct gpu_buffer * b;
++	IOReturn ret = kIOReturnSuccess;
++	uint64_t zero = 0, patience, waitBegan;
++
++	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (!gb->ready() && selector != kHakiosShow) {
++		return kIOReturnNotReady;                       /* given back: the run is ending */
++	}
++	bzero(&r, sizeof(r));
++	memcpy(&r, args->structureInput, size);
++
++	/* the Mali's: Panfrost's numbers, which overlap msm's (msm's fence wait, 0x47, stays: hakios-drm waits with it) */
++	if (gb == &gMali && selector >= kPanfrostSubmit && selector <= kPanfrostSetLabelBo && selector != kMsmWaitFence) {
++		ret = panfrostRequest(selector, &r);
++		if (ret == kIOReturnSuccess && args->structureOutput != NULL) {
++			if (args->structureOutputSize > size) {
++				args->structureOutputSize = (uint32_t) size;
++			}
++			memcpy(args->structureOutput, &r, args->structureOutputSize);
++		}
++		return ret;
++	}
++
++	switch (selector) {
++	case kMsmGetParam:
++		ret = gb->parameter(r.param.param, &r.param.value) ? kIOReturnSuccess : kIOReturnBadArgument;
++		break;
++	case kMsmSetParam:                              /* the program's name, for Linux's lists of who uses the GPU */
++	case kMsmGemCpuFini:
++	case kMsmSubmitQueueClose:
++		break;
++	case kMsmGemNew:
++		ret = gemNew(&r.gemNew);
++		break;
++	case kMsmGemInfo:
++		ret = gemInfo(&r.gemInfo);
++		break;
++	case kMsmGemCpuPrep:                            /* is the GPU done with a buffer: with all it has been given, here */
++		waitBegan = mach_absolute_time();
++		IOLockLock(gGPULock);
++		patience = (r.cpuPrep.op & MSM_PREP_NOSYNC) ? 0 : millisecondsUntil(&r.cpuPrep.timeout);
++		if (!gpuWait(gb->last(), patience)) {
++			ret = kIOReturnBusy;
++			if (patience == 0 && !(r.cpuPrep.op & MSM_PREP_NOSYNC)) {
++				waitOver(&r.cpuPrep.timeout, gb->last());
++			}
++		}
++		IOLockUnlock(gGPULock);
++		slowWait("cpu-prep", waitBegan);
++		break;
++	case kMsmGemSubmit:
++		ret = submit(&r.submit);
++		break;
++	case kMsmWaitFence:
++		waitBegan = mach_absolute_time();
++		IOLockLock(gGPULock);
++		/* a fence that was never issued is never done: refuse it, so that waiting for it cannot make gpuWait() declare the GPU dead for every client */
++		if ((int32_t)(r.waitFence.fence - gb->last()) > 0) {
++			IOLockUnlock(gGPULock);
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		patience = millisecondsUntil(&r.waitFence.timeout);
++		if (!gpuWait(r.waitFence.fence, patience)) {
++			ret = kIOReturnTimeout;
++			if (patience == 0) {
++				waitOver(&r.waitFence.timeout, r.waitFence.fence);
++			}
++		}
++		IOLockUnlock(gGPULock);
++		slowWait("fence", waitBegan);
++		break;
++	case kMsmGemMadvise:
++		r.madvise.retained = 1;
++		break;
++	case kMsmSubmitQueueNew:
++		r.queue.id = ++fNextQueue;
++		break;
++	case kMsmSubmitQueueQuery:                      /* how often the GPU has faulted on this client's commands */
++		if (r.query.data != 0 && r.query.len >= sizeof(zero)) {
++			copyout(&zero, (user_addr_t) r.query.data, sizeof(zero));
++		}
++		break;
++	case kDrmGemClose:
++		IOLockLock(gGPULock);
++		b = buffer(r.close.handle);
++		if (b == NULL) {
++			ret = kIOReturnBadArgument;
++		} else {
++			freeBuffer(b);
++			reap();
++		}
++		IOLockUnlock(gGPULock);
++		break;
++	case kHakiosSurface:
++		ret = surfaceBuffer(&r.surface);
++		break;
++	case kHakiosUserMemory:
++		ret = userBuffer(&r.user);
++		break;
++	case kHakiosShow:
++		ret = show(&r.show);
++		break;
++	default:
++		IOLog("HakiosGPU: request %#x (%zu bytes) is not known here\n", selector, size);
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	if (ret == kIOReturnSuccess && args->structureOutput != NULL) {
++		if (args->structureOutputSize > size) {
++			args->structureOutputSize = (uint32_t) size;
++		}
++		memcpy(args->structureOutput, &r, args->structureOutputSize);
++	}
++	return ret;
++}
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 6f6b308..6bf2395 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -713,6 +713,9 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 			}
+ 			extern void x1s_ps_start(void);
+ 			x1s_ps_start();
++			/* the Mali-G77: nothing unless booted with mali=N (and then only with a temperature from the heat guard) */
++			extern void hakios_mali_init(void);
++			hakios_mali_init();
+ 		}
+ 	}
+ 	mach_timespec_t     t;
+diff --git a/iokit/conf/files b/iokit/conf/files
+index a83ced6..b7ecf96 100644
+--- a/iokit/conf/files
++++ b/iokit/conf/files
+@@ -48,6 +48,7 @@ iokit/Kernel/IOService.cpp				optional iokitcpp
+ iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
+ iokit/Kernel/MiniIOSurface.cpp			optional iokitcpp
+ iokit/Kernel/MiniIOMobileFramebuffer.cpp		optional iokitcpp
++iokit/Kernel/hakios.gpu.cpp			optional iokitcpp
+ iokit/Kernel/IOServicePM.cpp				optional iokitcpp
+ iokit/Kernel/IOPMinformee.cpp				optional iokitcpp
+ iokit/Kernel/IOPMinformeeList.cpp			optional iokitcpp
