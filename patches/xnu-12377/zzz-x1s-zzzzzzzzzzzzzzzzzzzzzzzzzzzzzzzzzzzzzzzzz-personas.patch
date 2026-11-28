@@ -1,0 +1,57 @@
+diff --git a/bsd/kern/kern_persona.c b/bsd/kern/kern_persona.c
+index 44f92f5..b8bd7d7 100644
+--- a/bsd/kern/kern_persona.c
++++ b/bsd/kern/kern_persona.c
+@@ -960,3 +960,34 @@ persona_is_adoption_allowed(__unused struct persona *persona)
+ 	return FALSE;
+ }
+ #endif
++
++#if CONFIG_PERSONAS
++/*
++ * x1s (iOS 27 bring-up): launchd's usermanagerd boot task, which registers the personas on a phone, is skipped in this
++ * RAM-disk boot, and launchd then finds no persona of type 6 (system proxy): notifyd's event publisher fails with ESRCH
++ * and notifyd stops ("BUG IN LIBNOTIFY: Event publisher error"). The usual ones, made here before launchd starts:
++ * 99 System, 199 Default (uid 501, mobile) and a system-proxy persona.
++ */
++static void
++x1s_persona_make(uid_t id, const char *login, persona_type_t type, uid_t uid)
++{
++	int err = 0;
++	struct persona *p = persona_alloc(id, login, type, NULL, uid, &err);
++	if (p == NULL) {
++		printf("x1s persona: %u %s type %d: alloc error %d\n", id, login, type, err);
++		return;
++	}
++	err = persona_init_begin(p);
++	persona_init_end(p, err);
++	printf("x1s persona: %u %s type %d: %d\n", id, login, type, err);
++}
++
++void x1s_personas_init(void);
++void
++x1s_personas_init(void)
++{
++	x1s_persona_make(99, "System", PERSONA_SYSTEM, KAUTH_UID_NONE);
++	x1s_persona_make(199, "Default", PERSONA_DEFAULT, 501);
++	x1s_persona_make(299, "SystemProxy", PERSONA_SYSTEM_PROXY, KAUTH_UID_NONE);
++}
++#endif /* CONFIG_PERSONAS */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 0a24e6c..c7772f9 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -700,6 +700,13 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 			MiniIOSurfaceStart_c();
+ 			MiniIOMobileFramebufferStart_c();
+ 		}
++		/* x1s: the personas launchd's skipped usermanagerd boot task would register */
++		extern void x1s_personas_init(void);
++		static bool x1s_personas_done;
++		if (!x1s_personas_done) {
++			x1s_personas_done = true;
++			x1s_personas_init();
++		}
+ 	}
+ 	mach_timespec_t     t;
+ 	IOService *         service;
