@@ -1,0 +1,26 @@
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+index b189703..4d00a27 100644
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -229,11 +229,18 @@ unix_syscall(
+ 					which = 1;      /* openat, fstatat, fstatat64, mkdirat, getattrlistat, unlinkat */
+ 				}
+ 				path[0] = 0;
+-				if (which >= 0 && copyinstr((user_addr_t)uthread->uu_arg[which], path, sizeof(path), &got) != 0) {
+-					path[0] = 0;
++				if (which >= 0) {
++					/* a long path: keep its end, which says more than its start */
++					size_t off = 0;
++					while (copyinstr((user_addr_t)uthread->uu_arg[which] + off, path, sizeof(path), &got) == ENAMETOOLONG &&
++					    off < 1024) {
++						off += 48;
++					}
+ 				}
+ 				x1s_names_lines++;
+-				printf("x1s sys: %s[%d] syscall %d error %d %s\n", proc->p_comm, pid, code, error, path);
++				printf("x1s sys: %s[%d] syscall %d error %d a %llx %llx %llx %s\n", proc->p_comm, pid, code, error,
++				    (unsigned long long)uthread->uu_arg[0], (unsigned long long)uthread->uu_arg[1],
++				    (unsigned long long)uthread->uu_arg[2], path);
+ 			}
+ 		}
+ 	}
