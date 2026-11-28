@@ -1,0 +1,130 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 2467b24..5caa281 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -4452,6 +4452,25 @@ posix_spawn(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)
+ 			if ((error = copyin(px_args.attrp, &px_sa, px_sa_offset)) != 0) {
+ 				goto bad;
+ 			}
++			/*
++			 * x1s: iOS 27's libsystem_kernel _posix_spawnattr is 256 bytes, 8 more than here: after
++			 * psa_launch_type/psa_sec_flags it has task_security_policy (u32 @172) and use_sanitizers
++			 * (u8 @176), then crash_count @180, throttle_timeout @184, kqworkloop soft/hard @188/@192,
++			 * conclave mem limit @196. Read with this kernel's layout, launchd's throttle timeout became
++			 * the kqworkloop HARD limit and daemons were killed through the fatal port (as found by
++			 * ios-guacamole, psa27). Re-read those fields from their iOS 27 places.
++			 */
++			if (px_args.attr_size == 256 && offsetof(struct _posix_spawnattr, psa_crash_count) == 172) {
++				uint32_t psa27[7];
++				if ((error = copyin(px_args.attrp + 172, psa27, sizeof(psa27))) != 0) {
++					goto bad;
++				}
++				px_sa.psa_crash_count = psa27[2];
++				px_sa.psa_throttle_timeout = psa27[3];
++				px_sa.psa_kqworkloop_soft_limit = psa27[4];
++				px_sa.psa_kqworkloop_hard_limit = psa27[5];
++				px_sa.psa_conclave_mem_limit = psa27[6];
++			}
+ 
+ 			imgp->ip_px_sa = &px_sa;
+ 		}
+diff --git a/iokit/Kernel/MiniAppleKeyStore.cpp b/iokit/Kernel/MiniAppleKeyStore.cpp
+index 39738f7..8f2d4dd 100644
+--- a/iokit/Kernel/MiniAppleKeyStore.cpp
++++ b/iokit/Kernel/MiniAppleKeyStore.cpp
+@@ -570,6 +570,87 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
++/*
++ * x1s: IOWatchdog stand-in. iOS's watchdogd looks the service up by class (IOServiceMatching("IOWatchdog")),
++ * opens it (type 1) and crashes on purpose when it is missing. Selector 0 answers 0 = "userspace monitoring
++ * disabled": watchdogd then skips the PMU boot stage (boot-arg -wdt_no_pmu), sleeps and exits 0, and
++ * launchd does not restart it (KeepAlive SuccessfulExit=false). The S20 has no such hardware watchdog here.
++ */
++class IOWatchdog : public IOService
++{
++	OSDeclareDefaultStructors(IOWatchdog);
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IOWatchdog, IOService);
++
++bool
++IOWatchdog::start(IOService * provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "IOWatchdogUserClient");
++	registerService();
++	return true;
++}
++
++class IOWatchdogUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(IOWatchdogUserClient);
++public:
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IOWatchdogUserClient, IOUserClient);
++
++IOReturn
++IOWatchdogUserClient::clientClose(void)
++{
++	if (!isInactive()) {
++		terminate();
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOWatchdogUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
++{
++	static int logged;
++	if (logged < 8) {
++		logged++;
++		IOLog("x1s wdt: pid %d sel %u in %u out %u\n", proc_selfpid(),
++		    selector, args->scalarInputCount, args->scalarOutputCount);
++	}
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = 0;
++	}
++	return kIOReturnSuccess;
++}
++
++static void
++x1s_watchdog_start(void)
++{
++	IOService * resources = IOService::getResourceService();
++	IOWatchdog * wd = OSTypeAlloc(IOWatchdog);
++
++	if (resources == NULL || wd == NULL || !wd->init() || !wd->attach(resources)) {
++		OSSafeReleaseNULL(wd);
++		IOLog("x1s wdt: cannot create the service\n");
++		return;
++	}
++	if (!wd->start(resources)) {
++		wd->detach(resources);
++	} else {
++		IOLog("x1s wdt: IOWatchdog stand-in registered\n");
++	}
++	wd->release();
++}
++
+ void
+ MiniAppleKeyStoreStart(void)
+ {
+@@ -603,6 +684,7 @@ MiniAppleKeyStoreStart(void)
+ 		store->detach(resources);
+ 	}
+ 	store->release();
++	x1s_watchdog_start();
+ }
+ 
+ /* ---- Touch ID hooks for RedwoodMesa.cpp ---- */
