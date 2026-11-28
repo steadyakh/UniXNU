@@ -1,0 +1,34 @@
+diff --git a/iokit/Kernel/MiniAppleKeyStore.cpp b/iokit/Kernel/MiniAppleKeyStore.cpp
+index 8f2d4dd..a9ba812 100644
+--- a/iokit/Kernel/MiniAppleKeyStore.cpp
++++ b/iokit/Kernel/MiniAppleKeyStore.cpp
+@@ -635,6 +635,29 @@ IOWatchdogUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ static void
+ x1s_watchdog_start(void)
+ {
++	/*
++	 * watchdogd honours -wdt_no_pmu only on internal builds; otherwise it looks for "no-pmu" on
++	 * IODeviceTree:/arm-io/wdt, and without it asserts when there is no PMU to set the boot stage on.
++	 */
++	IORegistryEntry * armio = IORegistryEntry::fromPath("/arm-io", gIODTPlane);
++	if (armio) {
++		IORegistryEntry * wdtNode = armio->childFromPath("wdt", gIODTPlane);
++		if (!wdtNode) {
++			wdtNode = OSTypeAlloc(IORegistryEntry);
++			if (wdtNode && wdtNode->init()) {
++				wdtNode->setName("wdt");
++				wdtNode->attachToParent(armio, gIODTPlane);
++			} else {
++				OSSafeReleaseNULL(wdtNode);
++			}
++		}
++		if (wdtNode) {
++			wdtNode->setProperty("no-pmu", kOSBooleanTrue);
++			wdtNode->release();
++			IOLog("x1s wdt: /arm-io/wdt no-pmu set\n");
++		}
++		armio->release();
++	}
+ 	IOService * resources = IOService::getResourceService();
+ 	IOWatchdog * wd = OSTypeAlloc(IOWatchdog);
+ 
