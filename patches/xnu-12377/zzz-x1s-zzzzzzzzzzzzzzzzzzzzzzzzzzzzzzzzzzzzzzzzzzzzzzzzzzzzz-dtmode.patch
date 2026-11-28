@@ -1,0 +1,102 @@
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+index 4d00a27..b15cbb3 100644
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -200,6 +200,42 @@ unix_syscall(
+ 		if (x1s_names_state == 0) {
+ 			x1s_names_state = PE_parse_boot_argn("x1s_sysnames", x1s_names, sizeof(x1s_names) - 1) && x1s_names[0] ? 2 : 1;
+ 		}
++		/* stderr of the named processes (os_log text with OS_ACTIVITY_DT_MODE, see kern_exec.c) */
++		static int x1s_err_lines;
++		if (x1s_names_state == 2 && (code == 4 || code == 397) && uthread->uu_arg[0] == 2 && x1s_err_lines < 900) {
++			const char *n = x1s_names;
++			bool hit = false;
++			while (*n && !hit) {
++				size_t len = 0;
++				while (n[len] && n[len] != ',') {
++					len++;
++				}
++				if (len > 0 && strncmp(proc->p_comm, n, len) == 0) {
++					hit = true;
++				}
++				n += len;
++				if (*n == ',') {
++					n++;
++				}
++			}
++			if (hit) {
++				char text[176];
++				size_t want = (size_t)uthread->uu_arg[2];
++				if (want > sizeof(text) - 1) {
++					want = sizeof(text) - 1;
++				}
++				if (copyin((user_addr_t)uthread->uu_arg[1], text, want) == 0) {
++					text[want] = 0;
++					for (size_t i = 0; i < want; i++) {
++						if (text[i] == '\n' || text[i] == '\r') {
++							text[i] = ' ';
++						}
++					}
++					x1s_err_lines++;
++					printf("x1s sys: err %s[%d] %s\n", proc->p_comm, pid, text);
++				}
++			}
++		}
+ 		if (x1s_names_state == 2 && error != 0 && error != EJUSTRETURN && error != ERESTART && x1s_names_lines < 600) {
+ 			const char *n = x1s_names;
+ 			bool hit = false;
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 5caa281..6d79458 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6916,6 +6916,50 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
++	/*
++	 * x1s: boot-arg x1s_dtnames=a,b: programs whose file name starts with one of these get
++	 * OS_ACTIVITY_DT_MODE=YES, so their os_log text goes to stderr (copied to the console by
++	 * bsd/dev/arm/systemcalls.c). Bring-up only.
++	 */
++	{
++		static char x1s_dt[64];
++		static int x1s_dt_state;        /* 0 not read, 1 none, 2 some */
++		if (x1s_dt_state == 0) {
++			x1s_dt_state = PE_parse_boot_argn("x1s_dtnames", x1s_dt, sizeof(x1s_dt) - 1) && x1s_dt[0] ? 2 : 1;
++		}
++		if (x1s_dt_state == 2 && imgp->ip_strings != NULL) {
++			const char *base = imgp->ip_strings;
++			for (const char *c = imgp->ip_strings; *c; c++) {
++				if (*c == '/') {
++					base = c + 1;
++				}
++			}
++			const char *n = x1s_dt;
++			bool hit = false;
++			while (*n && !hit) {
++				size_t len = 0;
++				while (n[len] && n[len] != ',') {
++					len++;
++				}
++				if (len > 0 && strncmp(base, n, len) == 0) {
++					hit = true;
++				}
++				n += len;
++				if (*n == ',') {
++					n++;
++				}
++			}
++			if (hit) {
++				static const char x1s_dtvar[] = "OS_ACTIVITY_DT_MODE=YES";
++				if (exec_add_user_string(imgp, CAST_USER_ADDR_T(x1s_dtvar), UIO_SYSSPACE, TRUE) == 0 &&
++				    imgp->ip_argspace >= new_ptr_size) {
++					imgp->ip_argspace -= new_ptr_size;
++					imgp->ip_envc++;
++				}
++			}
++		}
++	}
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
