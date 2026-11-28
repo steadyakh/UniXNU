@@ -1,0 +1,21 @@
+diff --git a/bsd/kern/kern_minimac.c b/bsd/kern/kern_minimac.c
+index 1413f99..f9fb5fa 100644
+--- a/bsd/kern/kern_minimac.c
++++ b/bsd/kern/kern_minimac.c
+@@ -116,6 +116,16 @@ miniamfi_policy_syscall(__unused struct proc *p, int call, user_addr_t arg)
+ 	if (call == AMFI_SYSCALL_QUERY_BOOTARG_STATE) {
+ 		return copyout(&state, arg, sizeof(state));
+ 	}
++	/*
++	 * x1s: request 102, launch-constraint (LWCR) requirement match for an XPC peer (libxpc
++	 * xpc_peer_requirement_match_received_message, iOS 26/27). The caller hands a zeroed result and
++	 * asserts matched == (error_code == AICMR_MATCH (0)): a failure here with the zeroed code aborts
++	 * backboardd/familycircled (ios-guacamole). Nothing is enforced by this kernel: success, every
++	 * requirement matches, the result stays 0.
++	 */
++	if (call == 102) {
++		return 0;
++	}
+ 	if (call != AMFI_SYSCALL_CHECK_DYLD_POLICY) {
+ 		return ENOPOLICY;               /* what user space got before there was a handler */
+ 	}
