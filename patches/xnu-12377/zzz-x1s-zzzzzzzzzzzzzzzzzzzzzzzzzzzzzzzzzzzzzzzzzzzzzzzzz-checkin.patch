@@ -1,0 +1,20 @@
+diff --git a/osfmk/ipc/mach_port.c b/osfmk/ipc/mach_port.c
+index 7ef6a22..26907b1 100644
+--- a/osfmk/ipc/mach_port.c
++++ b/osfmk/ipc/mach_port.c
+@@ -2971,7 +2971,14 @@ mach_port_is_connection_for_service(
+ 	}
+ 
+ 	if (!mach_msg_filter_at_least(MACH_MSG_FILTER_CALLBACKS_VERSION_1)) {
+-		return KERN_NOT_SUPPORTED;
++		/*
++		 * x1s: no Sandbox kext registers message filter callbacks here. iOS 27's libxpc treats
++		 * KERN_NOT_SUPPORTED as a bogus check-in and drops every new-style XPC listener client
++		 * (found by ios-guacamole). Without filters there is nothing to check: answer as for a
++		 * service port without a sandbox label.
++		 */
++		*filter_policy_id = 0;
++		return KERN_SUCCESS;
+ 	}
+ 
+ 	ret = ipc_port_translate_receive(space, service_port_name, &service_port);
