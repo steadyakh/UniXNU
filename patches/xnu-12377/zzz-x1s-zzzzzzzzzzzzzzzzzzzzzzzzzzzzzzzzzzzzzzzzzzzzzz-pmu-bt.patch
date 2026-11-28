@@ -1,0 +1,102 @@
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index b5633e4..d2944a9 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -2037,6 +2037,17 @@ proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
+ 	task_t task = proc_task(p);
+ 
+ 
++#if __arm64__
++	/* x1s: a stack for every process killed by a crash-type signal (bring-up) */
++	if (p == current_proc() && WIFSIGNALED(rv)) {
++		int x1s_sig = WTERMSIG(rv);
++		if (x1s_sig == SIGABRT || x1s_sig == SIGTRAP || x1s_sig == SIGSEGV || x1s_sig == SIGBUS ||
++		    x1s_sig == SIGILL || x1s_sig == SIGFPE || x1s_sig == SIGSYS) {
++			extern void x1s_user_backtrace(const char *name, int pid, int sig);
++			x1s_user_backtrace(proc_best_name(p), proc_getpid(p), x1s_sig);
++		}
++	}
++#endif
+ 	if (p->p_crash_behavior != 0 || p == initproc) {
+ 		proc_handle_critical_exit(p, rv);
+ 	}
+diff --git a/iokit/Kernel/MiniAppleKeyStore.cpp b/iokit/Kernel/MiniAppleKeyStore.cpp
+index a9ba812..4b88b96 100644
+--- a/iokit/Kernel/MiniAppleKeyStore.cpp
++++ b/iokit/Kernel/MiniAppleKeyStore.cpp
+@@ -659,6 +659,18 @@ x1s_watchdog_start(void)
+ 		armio->release();
+ 	}
+ 	IOService * resources = IOService::getResourceService();
++	/*
++	 * watchdogd (non-internal builds) looks up {IOPropertyMatch: {IOPMUPrimary: true}} and asserts when
++	 * there is none; it then sets IOPMUBootStage on it, which this plain service refuses (logged, harmless).
++	 */
++	IOService * pmu = OSTypeAlloc(IOService);
++	if (resources != NULL && pmu != NULL && pmu->init() && pmu->attach(resources)) {
++		pmu->setName("x1s-pmu-placeholder");
++		pmu->setProperty("IOPMUPrimary", kOSBooleanTrue);
++		pmu->registerService();
++		IOLog("x1s wdt: IOPMUPrimary placeholder registered\n");
++	}
++	OSSafeReleaseNULL(pmu);
+ 	IOWatchdog * wd = OSTypeAlloc(IOWatchdog);
+ 
+ 	if (resources == NULL || wd == NULL || !wd->init() || !wd->attach(resources)) {
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index fd26264..29941ae 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -89,6 +89,7 @@
+ 
+ #include <vm/vm_map_xnu.h>
+ #include <vm/vm_map.h>
++#include <vm/vm_shared_region_xnu.h>
+ #include <sys/reason.h>
+ #include <security/mac_mach_internal.h>
+ #include <string.h>
+@@ -915,6 +916,44 @@ maybe_unrecoverable_exception_triage(
+  *	Returns:
+  *		KERN_SUCCESS if exception is handled by any of the handlers.
+  */
++/*
++ * x1s: one console line with the crashing thread's user frame-pointer chain and the shared cache slide,
++ * for processes that die by a fatal signal without a Mach exception (abort, os_crash ...). Called from
++ * proc_prepareexit (bsd/kern/kern_exit.c) in the dying thread's context.
++ */
++extern int copyin(const user_addr_t uaddr, void *kaddr, size_t len);
++void x1s_user_backtrace(const char *name, int pid, int sig);
++void
++x1s_user_backtrace(const char *name, int pid, int sig)
++{
++	thread_t thread = current_thread();
++	task_t task = current_task();
++	struct arm_saved_state *st = get_user_regs(thread);
++	char buf[480];
++	int n;
++
++	if (st == NULL || task == kernel_task) {
++		return;
++	}
++	uint64_t fp = get_saved_state_fp(st);
++	uint64_t slide = task->shared_region ? (uint64_t)task->shared_region->sr_slide : 0;
++	n = snprintf(buf, sizeof(buf), "x1s bt: %s[%d] sig %d slide 0x%llx pc 0x%llx lr 0x%llx fr",
++	    name, pid, sig, slide, (unsigned long long)get_saved_state_pc(st),
++	    (unsigned long long)get_saved_state_lr(st));
++	for (int i = 0; i < 16 && fp != 0 && n > 0 && n < (int)sizeof(buf) - 24; i++) {
++		uint64_t fr[2];
++		if (copyin((user_addr_t)fp, fr, sizeof(fr)) != 0) {
++			break;
++		}
++		n += snprintf(buf + n, sizeof(buf) - n, " %llx", (unsigned long long)(fr[1] & 0x0000007fffffffffULL));
++		if (fr[0] <= fp) {
++			break;
++		}
++		fp = fr[0];
++	}
++	printf("%s\n", buf);
++}
++
+ int debug4k_panic_on_exception = 0;
+ kern_return_t
+ exception_triage(
