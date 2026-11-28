@@ -1,0 +1,12 @@
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 29941ae..15b1498 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -921,7 +921,6 @@ maybe_unrecoverable_exception_triage(
+  * for processes that die by a fatal signal without a Mach exception (abort, os_crash ...). Called from
+  * proc_prepareexit (bsd/kern/kern_exit.c) in the dying thread's context.
+  */
+-extern int copyin(const user_addr_t uaddr, void *kaddr, size_t len);
+ void x1s_user_backtrace(const char *name, int pid, int sig);
+ void
+ x1s_user_backtrace(const char *name, int pid, int sig)
