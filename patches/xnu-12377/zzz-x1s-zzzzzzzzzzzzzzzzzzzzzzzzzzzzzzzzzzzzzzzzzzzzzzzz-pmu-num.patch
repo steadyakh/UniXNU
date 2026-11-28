@@ -1,0 +1,13 @@
+diff --git a/iokit/Kernel/MiniAppleKeyStore.cpp b/iokit/Kernel/MiniAppleKeyStore.cpp
+index 4b88b96..4918c9b 100644
+--- a/iokit/Kernel/MiniAppleKeyStore.cpp
++++ b/iokit/Kernel/MiniAppleKeyStore.cpp
+@@ -666,7 +666,7 @@ x1s_watchdog_start(void)
+ 	IOService * pmu = OSTypeAlloc(IOService);
+ 	if (resources != NULL && pmu != NULL && pmu->init() && pmu->attach(resources)) {
+ 		pmu->setName("x1s-pmu-placeholder");
+-		pmu->setProperty("IOPMUPrimary", kOSBooleanTrue);
++		pmu->setProperty("IOPMUPrimary", 1ULL, 32);   /* watchdogd matches the number 1, not a boolean */
+ 		pmu->registerService();
+ 		IOLog("x1s wdt: IOPMUPrimary placeholder registered\n");
+ 	}
