@@ -1,0 +1,18 @@
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index c7772f9..e586e3b 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -705,7 +705,12 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 		static bool x1s_personas_done;
+ 		if (!x1s_personas_done) {
+ 			x1s_personas_done = true;
+-			x1s_personas_init();
++			/* x1s_personas=0: leave them to usermanagerd's boot task (runs when not in restore mode) */
++			int x1s_pers = 1;
++			PE_parse_boot_argn("x1s_personas", &x1s_pers, sizeof(x1s_pers));
++			if (x1s_pers) {
++				x1s_personas_init();
++			}
+ 		}
+ 	}
+ 	mach_timespec_t     t;
