@@ -1,0 +1,57 @@
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+index c1e7675..b189703 100644
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -190,6 +190,52 @@ unix_syscall(
+ 		if (x1s_systrace > 0 && error != 0 && error != EJUSTRETURN && error != ERESTART && pid <= x1s_systrace) {
+ 			printf("x1s sys: %s[%d] syscall %d error %d\n", proc->p_comm, pid, code, error);
+ 		}
++		/*
++		 * boot-arg x1s_sysnames=a,b,c: failing system calls of processes whose name starts with one of
++		 * these, with the path for the common path calls (first 600 lines).
++		 */
++		static char x1s_names[64];
++		static int x1s_names_state;     /* 0 not read, 1 none, 2 some */
++		static int x1s_names_lines;
++		if (x1s_names_state == 0) {
++			x1s_names_state = PE_parse_boot_argn("x1s_sysnames", x1s_names, sizeof(x1s_names) - 1) && x1s_names[0] ? 2 : 1;
++		}
++		if (x1s_names_state == 2 && error != 0 && error != EJUSTRETURN && error != ERESTART && x1s_names_lines < 600) {
++			const char *n = x1s_names;
++			bool hit = false;
++			while (*n && !hit) {
++				size_t len = 0;
++				while (n[len] && n[len] != ',') {
++					len++;
++				}
++				if (len > 0 && strncmp(proc->p_comm, n, len) == 0) {
++					hit = true;
++				}
++				n += len;
++				if (*n == ',') {
++					n++;
++				}
++			}
++			if (hit) {
++				char path[96];
++				size_t got = 0;
++				int which = -1;
++				/* open, access, stat, lstat, mkdir, getattrlist, stat64, lstat64, open_nocancel, chdir, unlink, rename */
++				if (code == 5 || code == 33 || code == 188 || code == 190 || code == 136 || code == 220 ||
++				    code == 338 || code == 340 || code == 398 || code == 12 || code == 10 || code == 128 ||
++				    code == 345) {
++					which = 0;
++				} else if (code == 463 || code == 469 || code == 470 || code == 472 || code == 476 || code == 475) {
++					which = 1;      /* openat, fstatat, fstatat64, mkdirat, getattrlistat, unlinkat */
++				}
++				path[0] = 0;
++				if (which >= 0 && copyinstr((user_addr_t)uthread->uu_arg[which], path, sizeof(path), &got) != 0) {
++					path[0] = 0;
++				}
++				x1s_names_lines++;
++				printf("x1s sys: %s[%d] syscall %d error %d %s\n", proc->p_comm, pid, code, error, path);
++			}
++		}
+ 	}
+ 
+ #if CONFIG_MACF
