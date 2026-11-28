@@ -1,0 +1,48 @@
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+index b15cbb3..2731a87 100644
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -202,7 +202,8 @@ unix_syscall(
+ 		}
+ 		/* stderr of the named processes (os_log text with OS_ACTIVITY_DT_MODE, see kern_exec.c) */
+ 		static int x1s_err_lines;
+-		if (x1s_names_state == 2 && (code == 4 || code == 397) && uthread->uu_arg[0] == 2 && x1s_err_lines < 900) {
++		if (x1s_names_state == 2 && (code == 4 || code == 397 || code == 121 || code == 412) &&
++		    (uthread->uu_arg[0] == 2 || uthread->uu_arg[0] == 1) && x1s_err_lines < 900) {
+ 			const char *n = x1s_names;
+ 			bool hit = false;
+ 			while (*n && !hit) {
+@@ -220,11 +221,32 @@ unix_syscall(
+ 			}
+ 			if (hit) {
+ 				char text[176];
++				user_addr_t from = (user_addr_t)uthread->uu_arg[1];
+ 				size_t want = (size_t)uthread->uu_arg[2];
++				if (code == 121 || code == 412) {
++					/* writev: gather the first pieces of the iovec array */
++					uint64_t iov[2 * 6];
++					size_t cnt = want > 6 ? 6 : want, have = 0;
++					want = 0;
++					if (cnt > 0 && copyin(from, iov, cnt * 16) == 0) {
++						for (size_t k = 0; k < cnt && have < sizeof(text) - 1; k++) {
++							size_t part = (size_t)iov[2 * k + 1];
++							if (part > sizeof(text) - 1 - have) {
++								part = sizeof(text) - 1 - have;
++							}
++							if (part && copyin((user_addr_t)iov[2 * k], text + have, part) == 0) {
++								have += part;
++							}
++						}
++					}
++					text[have] = 0;
++					want = have;
++					from = 0;
++				}
+ 				if (want > sizeof(text) - 1) {
+ 					want = sizeof(text) - 1;
+ 				}
+-				if (copyin((user_addr_t)uthread->uu_arg[1], text, want) == 0) {
++				if (from == 0 || copyin(from, text, want) == 0) {
+ 					text[want] = 0;
+ 					for (size_t i = 0; i < want; i++) {
+ 						if (text[i] == '\n' || text[i] == '\r') {
