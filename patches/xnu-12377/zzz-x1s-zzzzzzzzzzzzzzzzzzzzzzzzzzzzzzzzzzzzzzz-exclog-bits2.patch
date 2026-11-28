@@ -1,0 +1,13 @@
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 307bc61..0a9c875 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -929,7 +929,7 @@ exception_triage(
+ 
+ #if __arm64__
+ 	/* x1s: where a user process crashes (bring-up) */
+-	exception_type_t x1s_e = exception & ~(EXC_MAY_BE_UNRECOVERABLE_BIT | EXC_PTRAUTH_BIT);   /* the flag bits */
++	exception_type_t x1s_e = exception & ~(EXC_MAY_BE_UNRECOVERABLE_BIT | 0x200);   /* the flag bits (0x200: ptrauth) */
+ 	if (task != kernel_task && (x1s_e == EXC_BAD_ACCESS || x1s_e == EXC_BAD_INSTRUCTION ||
+ 	    x1s_e == EXC_ARITHMETIC || x1s_e == EXC_BREAKPOINT || x1s_e == EXC_GUARD)) {
+ 		struct arm_saved_state *x1s_st = get_user_regs(thread);
