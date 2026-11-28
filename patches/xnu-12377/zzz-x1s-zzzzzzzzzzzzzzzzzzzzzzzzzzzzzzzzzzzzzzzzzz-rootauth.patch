@@ -1,0 +1,20 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index ffe7ce0..c66cad9 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -948,7 +948,14 @@ bsd_init(void)
+ 			/* enforce sealedness */
+ 			int autherr = VNOP_IOCTL(rootvnode, FSIOC_KERNEL_ROOTAUTH, NULL, 0, vfs_context_kernel());
+ 			if (autherr) {
+-				panic("rootvp not authenticated after mounting");
++				/* x1s: the S20's root is an unsealed APFS image in memory (rootdev=md0: no rd=, so that launchd does
++				 * not take it for a restore); boot-arg x1s_rootauth=1 restores the panic */
++				int x1s_ra = 0;
++				PE_parse_boot_argn("x1s_rootauth", &x1s_ra, sizeof(x1s_ra));
++				if (x1s_ra) {
++					panic("rootvp not authenticated after mounting");
++				}
++				printf("x1s: root not authenticated (%d): going on (unsealed image)\n", autherr);
+ 			}
+ 		}
+ 	}
