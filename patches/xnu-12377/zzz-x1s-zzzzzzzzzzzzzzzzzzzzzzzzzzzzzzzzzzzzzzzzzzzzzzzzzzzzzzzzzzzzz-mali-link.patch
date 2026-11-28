@@ -1,0 +1,43 @@
+diff --git a/bsd/dev/x1s_gpu_glue.c b/bsd/dev/x1s_gpu_glue.c
+index b43e0cb..4ecfebe 100644
+--- a/bsd/dev/x1s_gpu_glue.c
++++ b/bsd/dev/x1s_gpu_glue.c
+@@ -18,18 +18,29 @@
+ #include <sys/errno.h>
+ #include <sys/systm.h>
+ 
+-/* drivers/ArmCpu heatguard.inc: the last reading of each zone (0 BIG, 1 MID, 2 LITTLE, 3 G3D), -1 if none */
+-extern volatile int32_t x1s_heat_zone[4];
+-extern volatile uint32_t x1s_heat_reads;
+-
++/*
++ * The GPU's temperature. The heat guard (drivers/ArmCpu heatguard.inc) reads every zone once a second, but it is a
++ * kext of its own and its x1s_heat_zone[] cannot be linked from here. Until it hands its readings to the kernel,
++ * the answer is "not known" -- and with no temperature the Mali driver refuses to power the GPU on (its own rule).
++ */
+ int hakios_exynos_temperature(uint32_t zone);
+ int
+-hakios_exynos_temperature(uint32_t zone)
++hakios_exynos_temperature(__unused uint32_t zone)
++{
++	return -1;
++}
++
++/* the HakiOS loader's log and return path (loader_return.c), used only by the mali_return= and log options */
++void loader_log_putc(char c);
++void
++loader_log_putc(__unused char c)
++{
++}
++
++void loader_return(void);
++void
++loader_return(void)
+ {
+-	if (zone > 3 || x1s_heat_reads == 0) {
+-		return -1;      /* no guard reading yet: no temperature, so the Mali driver will not power on */
+-	}
+-	return x1s_heat_zone[zone];
+ }
+ 
+ int hakios_exynos_acpm(uint32_t channel, uint32_t cmd[4]);
