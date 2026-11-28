@@ -1,0 +1,40 @@
+diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index f3367e7..5b0f1a3 100644
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -4055,8 +4055,12 @@ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ /* Keep incompatible core renderers on their established path. Filtering is
+  * request-local: never remove properties from the shared live registry table,
+  * never patch user-space IOKit entry points or recursively call another hook. */
++static bool gMetalForAll;        /* metal=2 (iOS 27: no OpenGL ES road for anyone, so nobody is held back) */
+ static bool rw_graphics_legacy_client(void)
+ {
++    if (gMetalForAll) {
++        return false;
++    }
+     char name[32] = {0};
+     proc_selfname(name, sizeof(name));
+     return rw_graphics_legacy_process(name);
+@@ -4437,6 +4441,22 @@ publishAccelerator(IOService * provider)
+ 	if (accelerator != NULL && accelerator->init() && accelerator->attach(provider)) {
+ 		accelerator->setName("sgx");
+         accelerator->setProperty("RedwoodGraphicsPolicyVersion", (unsigned long long)1, 32);
++		/*
++		 * x1s (iOS 27): metal=2 names the plug-in here, with no user-space switch. Metal opens
++		 * "/System/Library/Extensions/" + name + ".bundle"; the default name climbs out of that
++		 * folder to the boot image's /redwood/lib/RedwoodMetal.bundle (boot-arg metal_name=
++		 * overrides it).
++		 */
++		if (metal == 2) {
++			char name[96] = "../../../redwood/lib/RedwoodMetal";
++
++			gMetalForAll = true;
++
++			PE_parse_boot_arg_str("metal_name", name, sizeof(name));
++			accelerator->setProperty(kAcceleratorPluginNameKey, name);
++			accelerator->setProperty(kAcceleratorPluginClassNameKey, "RedwoodMetalDevice");
++			IOLog("IOAcceleratorES: metal=2: Metal plug-in %s, class RedwoodMetalDevice\n", name);
++		}
+ 		accelerator->registerService();
+ 		/* the first line to look for in the log of such a boot: the gate is open, nothing is set yet */
+ 		if (gAcceleratorTakesProperties) {
