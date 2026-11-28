@@ -1,0 +1,13 @@
+diff --git a/bsd/dev/hakios.mali.c b/bsd/dev/hakios.mali.c
+index c2aeb70..df7aa0a 100644
+--- a/bsd/dev/hakios.mali.c
++++ b/bsd/dev/hakios.mali.c
+@@ -53,7 +53,7 @@
+ #include <pexpert/pexpert.h>
+ #include <sys/hakios.input.h>
+ #include <sys/systm.h>
+-#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern uint64_t kvtophys(vm_offset_t va);
