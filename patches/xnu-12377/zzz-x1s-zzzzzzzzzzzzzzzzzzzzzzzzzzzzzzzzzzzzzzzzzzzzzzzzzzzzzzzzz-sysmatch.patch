@@ -1,0 +1,65 @@
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+index 2731a87..b64946b 100644
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -258,7 +258,46 @@ unix_syscall(
+ 				}
+ 			}
+ 		}
+-		if (x1s_names_state == 2 && error != 0 && error != EJUSTRETURN && error != ERESTART && x1s_names_lines < 600) {
++		/* boot-arg x1s_sysmatch=a,b: only path calls whose path contains one of these, failed or not */
++		static char x1s_match[64];
++		static int x1s_match_state;     /* 0 not read, 1 none, 2 some */
++		if (x1s_match_state == 0) {
++			x1s_match_state = PE_parse_boot_argn("x1s_sysmatch", x1s_match, sizeof(x1s_match) - 1) && x1s_match[0] ? 2 : 1;
++		}
++		if (x1s_names_state == 2 && x1s_match_state == 2 && x1s_names_lines < 600 &&
++		    (code == 5 || code == 33 || code == 188 || code == 190 || code == 220 || code == 338 ||
++		    code == 340 || code == 398 || code == 463 || code == 469 || code == 470 || code == 476)) {
++			int which = (code == 463 || code == 469 || code == 470 || code == 476) ? 1 : 0;
++			char path[160];
++			size_t got = 0;
++			if (copyinstr((user_addr_t)uthread->uu_arg[which], path, sizeof(path), &got) == 0) {
++				const char *m = x1s_match;
++				bool hit = false;
++				while (*m && !hit) {
++					char one[32];
++					size_t len = 0;
++					while (m[len] && m[len] != ',' && len < sizeof(one) - 1) {
++						one[len] = m[len];
++						len++;
++					}
++					one[len] = 0;
++					if (len > 0 && strnstr(path, one, sizeof(path)) != NULL) {
++						hit = true;
++					}
++					m += len;
++					while (*m && *m != ',') {
++						m++;
++					}
++					if (*m == ',') {
++						m++;
++					}
++				}
++				if (hit) {
++					x1s_names_lines++;
++					printf("x1s sys: %s[%d] syscall %d error %d %s\n", proc->p_comm, pid, code, error, path);
++				}
++			}
++		} else if (x1s_names_state == 2 && x1s_match_state != 2 && error != 0 && error != EJUSTRETURN && error != ERESTART && x1s_names_lines < 600) {
+ 			const char *n = x1s_names;
+ 			bool hit = false;
+ 			while (*n && !hit) {
+diff --git a/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index 5b0f1a3..4de1142 100644
+--- a/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -4455,7 +4455,7 @@ publishAccelerator(IOService * provider)
+ 			PE_parse_boot_arg_str("metal_name", name, sizeof(name));
+ 			accelerator->setProperty(kAcceleratorPluginNameKey, name);
+ 			accelerator->setProperty(kAcceleratorPluginClassNameKey, "RedwoodMetalDevice");
+-			IOLog("IOAcceleratorES: metal=2: Metal plug-in %s, class RedwoodMetalDevice\n", name);
++			IOLog("x1s fb: metal=2: Metal plug-in %s, class RedwoodMetalDevice\n", name);
+ 		}
+ 		accelerator->registerService();
+ 		/* the first line to look for in the log of such a boot: the gate is open, nothing is set yet */
