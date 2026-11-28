@@ -1,0 +1,30 @@
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+index b64946b..6847efd 100644
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -264,7 +264,24 @@ unix_syscall(
+ 		if (x1s_match_state == 0) {
+ 			x1s_match_state = PE_parse_boot_argn("x1s_sysmatch", x1s_match, sizeof(x1s_match) - 1) && x1s_match[0] ? 2 : 1;
+ 		}
+-		if (x1s_names_state == 2 && x1s_match_state == 2 && x1s_names_lines < 600 &&
++		bool x1s_name_hit = false;
++		if (x1s_names_state == 2) {
++			const char *n = x1s_names;
++			while (*n && !x1s_name_hit) {
++				size_t len = 0;
++				while (n[len] && n[len] != ',') {
++					len++;
++				}
++				if (len > 0 && strncmp(proc->p_comm, n, len) == 0) {
++					x1s_name_hit = true;
++				}
++				n += len;
++				if (*n == ',') {
++					n++;
++				}
++			}
++		}
++		if (x1s_name_hit && x1s_match_state == 2 && x1s_names_lines < 600 &&
+ 		    (code == 5 || code == 33 || code == 188 || code == 190 || code == 220 || code == 338 ||
+ 		    code == 340 || code == 398 || code == 463 || code == 469 || code == 470 || code == 476)) {
+ 			int which = (code == 463 || code == 469 || code == 470 || code == 476) ? 1 : 0;
