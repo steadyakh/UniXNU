@@ -1,0 +1,20 @@
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 0a9c875..fd26264 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -935,12 +935,13 @@ exception_triage(
+ 		struct arm_saved_state *x1s_st = get_user_regs(thread);
+ 		void *x1s_p = get_bsdtask_info(task);
+ 		if (x1s_st != NULL) {
+-			printf("x1s exc: %s[%d] exception %d codes 0x%llx 0x%llx pc 0x%llx lr 0x%llx sp 0x%llx far 0x%llx esr 0x%x\n",
++			printf("x1s exc: %s[%d] exception %d codes 0x%llx 0x%llx pc 0x%llx lr 0x%llx sp 0x%llx far 0x%llx esr 0x%x x0 0x%llx x1 0x%llx x2 0x%llx\n",
+ 			    x1s_p ? proc_name_address(x1s_p) : "?", task_pid(task), exception,
+ 			    (unsigned long long)code[0], (unsigned long long)(codeCnt > 1 ? code[1] : 0),
+ 			    (unsigned long long)get_saved_state_pc(x1s_st), (unsigned long long)get_saved_state_lr(x1s_st),
+ 			    (unsigned long long)get_saved_state_sp(x1s_st), (unsigned long long)get_saved_state_far(x1s_st),
+-			    (unsigned)get_saved_state_esr(x1s_st));
++			    (unsigned)get_saved_state_esr(x1s_st), (unsigned long long)get_saved_state_reg(x1s_st, 0),
++			    (unsigned long long)get_saved_state_reg(x1s_st, 1), (unsigned long long)get_saved_state_reg(x1s_st, 2));
+ 		}
+ 	}
+ #endif
